@@ -254,6 +254,7 @@ const providerCapacityBadge = mustGet("provider-capacity-badge");
 const providerCapacityUpdated = mustGet("provider-capacity-updated");
 const providerCapacityChart = mustGet("provider-capacity-chart");
 const providerCapacityList = mustGet("provider-capacity-list");
+const providerCapacityLedger = mustGet("provider-capacity-ledger");
 
 let currentKeyView = "active";
 let currentAdminView = "loading";
@@ -869,6 +870,17 @@ const toNumber = (value) => {
 
 const formatNumber = (value) => numberFormatter.format(toNumber(value));
 const formatCompactNumber = (value) => compactNumberFormatter.format(toNumber(value));
+const formatByteSize = (value) => {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${unit === 0 ? formatNumber(Math.round(size)) : size.toFixed(size >= 100 ? 0 : 1)} ${units[unit]}`;
+};
 const formatDecimal = (value) => {
   if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
   return decimalFormatter.format(value);
@@ -2629,6 +2641,56 @@ const renderProviderCapacityChart = (snapshot, sources, fiveXxBuckets = []) => {
   updateCapacityChartScrollControls(chartScroll, olderButton, newerButton);
 };
 
+/**
+ * Paid-fallback ledger growth, measured by the daily counters and carried on the
+ * capacity payload. The byte figures are logical JSON-row estimates, not the
+ * physical SQLite/WAL footprint of the shared KV database and not total host
+ * storage. Reaching the threshold reuses the existing warning treatment.
+ */
+const renderProviderCapacityLedger = (snapshot) => {
+  const ledgerGrowth = snapshot?.ledger_growth;
+  if (!ledgerGrowth || typeof ledgerGrowth !== "object") {
+    providerCapacityLedger.textContent = "";
+    delete providerCapacityLedger.dataset.tone;
+    return;
+  }
+  if (ledgerGrowth.scan !== "ok") {
+    providerCapacityLedger.textContent = "Ledger growth counters could not be read from KV.";
+    delete providerCapacityLedger.dataset.tone;
+    return;
+  }
+  const parts = [];
+  if (typeof ledgerGrowth.estimated_retained_raw_bytes === "number") {
+    parts.push(
+      `~${formatByteSize(ledgerGrowth.estimated_retained_raw_bytes)} of retained settled rows over ${
+        formatNumber(ledgerGrowth.retention_days ?? 365)
+      } days`,
+    );
+  }
+  if (typeof ledgerGrowth.avg_row_bytes === "number") {
+    parts.push(`~${formatNumber(Math.round(ledgerGrowth.avg_row_bytes))} B per settled row`);
+  }
+  const projection = Array.isArray(ledgerGrowth.projections)
+    ? ledgerGrowth.projections.find((entry) => entry?.window_days === 30) ?? ledgerGrowth.projections.at(-1)
+    : null;
+  if (projection && typeof projection.avg_read_units_per_view === "number") {
+    parts.push(
+      `${formatNumber(projection.avg_read_units_per_view)} KV read units per ${
+        projection.window_days ?? 30
+      }-day quota projection`,
+    );
+  }
+  if (!parts.length) parts.push("no settled rows measured yet");
+  const threshold = formatByteSize(
+    typeof ledgerGrowth.alert_threshold_bytes === "number" ? ledgerGrowth.alert_threshold_bytes : 0,
+  );
+  const alert = ledgerGrowth.alert === true;
+  parts.push(alert ? `storage alert ≥ ${threshold}` : `alert at ${threshold}`);
+  providerCapacityLedger.textContent = `Ledger estimate: ${parts.join(" · ")}. JSON-row estimate, not total storage.`;
+  if (alert) providerCapacityLedger.dataset.tone = "warning";
+  else delete providerCapacityLedger.dataset.tone;
+};
+
 const renderProviderCapacity = (snapshot, fiveXxBuckets = []) => {
   const rawSources = Array.isArray(snapshot?.sources) ? snapshot.sources : [];
   const sourceForSlot = (slot) =>
@@ -2656,6 +2718,7 @@ const renderProviderCapacity = (snapshot, fiveXxBuckets = []) => {
   const snapshotAt = typeof snapshot?.snapshot_at_ms === "number" ? snapshot.snapshot_at_ms : null;
   const cacheState = typeof snapshot?.cache_state === "string" ? snapshot.cache_state : "unavailable";
   providerCapacityUpdated.textContent = `Snapshot ${formatCapacityTimestamp(snapshotAt)} · ${cacheState}`;
+  renderProviderCapacityLedger(snapshot);
 };
 
 const loadProviderCapacity = async () => {
@@ -9454,6 +9517,8 @@ tokenInput.addEventListener("input", () => {
   latestProviderCapacityChartState = null;
   latestProviderHealth = null;
   providerCapacityChart.replaceChildren();
+  providerCapacityLedger.textContent = "";
+  delete providerCapacityLedger.dataset.tone;
   clearApiKeyRequestLogCaches();
   if (!hasAdminCredential()) {
     setAuthBadge("bad", "Missing token");
@@ -9657,6 +9722,8 @@ baseSelect.addEventListener("change", () => {
   latestProviderCapacityChartState = null;
   latestProviderHealth = null;
   providerCapacityChart.replaceChildren();
+  providerCapacityLedger.textContent = "";
+  delete providerCapacityLedger.dataset.tone;
   resetAdminPrefetchState(hasAdminCredential() ? "Checking admin session..." : "Sign in to prepare the admin views.");
   scheduleTokenCheck();
   if (currentAdminView === "keys") {

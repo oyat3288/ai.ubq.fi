@@ -24,6 +24,8 @@ import {
 } from "./capacity-rollups.ts";
 import { readPromptCacheAnalytics } from "../cache/prompt-analytics.ts";
 import { getConfiguredMeteredQuotaSnapshot, METERED_QUOTA_FRESH_MS, type MeteredQuotaSnapshot } from "../metered-quota.ts";
+import { PAID_FALLBACK_REQUEST_LOG_RETENTION_MS } from "../paid-fallback/ledger-state.ts";
+import { readPaidFallbackLedgerGrowth } from "../paid-fallback/ledger-stats.ts";
 import { sha256Hex } from "../utils.ts";
 import {
   PROVIDER_CAPACITY_CODEX_TIMEOUT_MS,
@@ -660,6 +662,12 @@ export const handleProviderCapacity = async (
   options: ProviderCapacitySnapshotOptions = {}
 ): Promise<Response> => {
   const promptCache = readPromptCacheAnalytics({ kv: options.kv, now: options.now });
+  // The admin Provider analytics card is the current operator surface for the
+  // paid-fallback ledger growth estimate. This is a bounded daily-counter scan
+  // (retention rows only) and never touches the capacity rollups.
+  const nowMs = safeNow(options.now ?? Date.now);
+  const kv = options.kv === undefined ? await getKv() : options.kv;
+  const ledgerGrowth = await readPaidFallbackLedgerGrowth(kv, { nowMs, retentionMs: PAID_FALLBACK_REQUEST_LOG_RETENTION_MS });
   try {
     const live = new URL(request.url).searchParams.get("refresh") === "live";
     // `?refresh=live` keeps forcing an operator probe. A normal read serves the
@@ -672,12 +680,16 @@ export const handleProviderCapacity = async (
     // source unavailable rather than fabricating a percentage.
     const cached = await getPersistedProviderCapacityView(options).catch(() => null);
     if (!live && cached && capacityViewIsFresh(cached, safeNow(options.now ?? Date.now))) {
-      return json(200, { ...cached, prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
+      return json(200, { ...cached, prompt_cache: await promptCache, ledger_growth: ledgerGrowth }, { "Cache-Control": "no-store" });
     }
     const refreshed = await refreshProviderCapacity(options).catch(() => null);
     const view = refreshed ?? cached ?? unavailableView(Date.now(), [], [], [], []);
-    return json(200, { ...view, prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
+    return json(200, { ...view, prompt_cache: await promptCache, ledger_growth: ledgerGrowth }, { "Cache-Control": "no-store" });
   } catch {
-    return json(200, { ...unavailableView(Date.now(), [], [], [], []), prompt_cache: await promptCache }, { "Cache-Control": "no-store" });
+    return json(
+      200,
+      { ...unavailableView(Date.now(), [], [], [], []), prompt_cache: await promptCache, ledger_growth: ledgerGrowth },
+      { "Cache-Control": "no-store" }
+    );
   }
 };
