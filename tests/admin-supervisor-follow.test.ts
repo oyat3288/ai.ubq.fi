@@ -31,18 +31,18 @@ class FakeElement {
   disabled = false;
   title = "";
   value = "";
-  private text = "";
+  private _text = "";
 
   constructor(tag = "div") {
     this.tag = tag;
   }
 
   get textContent(): string {
-    return this.text;
+    return this._text;
   }
 
   set textContent(value: string) {
-    this.text = value;
+    this._text = value;
     this.children.length = 0;
   }
 
@@ -132,17 +132,21 @@ class FakeDocument {
 }
 
 class FakeSection {
-  private readonly elements = new Map<string, FakeElement>();
+  private readonly _elements = new Map<string, FakeElement>();
 
   querySelector(selector: string): FakeElement {
     const id = selector.startsWith("#") ? selector.slice(1) : selector;
-    let element = this.elements.get(id);
+    let element = this._elements.get(id);
     if (!element) {
       element = new FakeElement("section");
-      this.elements.set(id, element);
+      this._elements.set(id, element);
     }
     return element;
   }
+
+  // The view appends its read-only providers card to the real section; the
+  // follow harness never reads that card back.
+  append(): void {}
 }
 
 const requestUrlOf = (input: unknown): string => {

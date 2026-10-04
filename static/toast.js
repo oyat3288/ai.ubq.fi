@@ -92,8 +92,8 @@ const showToast = (options = {}) => {
   toastEl.appendChild(closeEl);
 
   host.appendChild(toastEl);
-  while (host.querySelectorAll("[data-toast]").length > MAX_VISIBLE) {
-    const oldest = host.querySelector("[data-toast]");
+  while (host.querySelectorAll("[data-toast]:not([data-exiting])").length > MAX_VISIBLE) {
+    const oldest = host.querySelector("[data-toast]:not([data-exiting])");
     if (oldest === toastEl) break;
     dismissToastEl(oldest, null);
   }
@@ -159,7 +159,7 @@ const toast = (options) => showToast(options);
 toast.success = (title, options = {}) => showToast({ ...options, type: "success", title });
 toast.error = (title, options = {}) => showToast({ ...options, type: "error", title });
 toast.info = (title, options = {}) => showToast({ ...options, type: "info", title });
-toast.loading = (title, options = {}) => showToast({ ...options, type: "info", title, duration: Infinity });
+toast.loading = (title, options = {}) => showToast({ ...options, type: "info", title, duration: 0 });
 
 toast.dismiss = (handle) => handle?.dismiss?.();
 toast.dismissAll = () => {

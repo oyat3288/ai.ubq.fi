@@ -6,6 +6,208 @@ entries when a decision changes; add a new entry that supersedes the earlier one
 
 Each entry must distinguish the decision from its implementation, validation, deployment, and live acceptance state.
 
+## 2026-09-24 — A refused Ultra tier stays on `-fast` until the vendor's own reset instant
+
+### Decision
+
+A `429` from `deepseek-ai/DeepSeek-V4.1-Flash-ultra` still retries that one request on its sibling, and now also opens
+an in-process window: every later request for the Ultra tier is dispatched straight to
+`deepseek-ai/DeepSeek-V4.1-Flash-fast` until the reset instant the refusal's own headers named (`retry-after-ms`, then
+`retry-after`, then the later `x-ratelimit-reset-*` delta). Once that instant passes, Ultra is asked again, and a fresh
+refusal reopens the window. A refusal that names no window, or carries `x-should-retry: false`, opens nothing and stays
+a per-request failover. The window is per gateway process and only for the mapped pair, so a tier without a configured
+sibling never accumulates state.
+
+The sibling's own model id is likewise accepted as the answer to an Ultra request, and only for that pair: the vendor
+self-echoes `deepseek-ai/DeepSeek-V4.1-Flash-fast` when that tier serves, so without the allowance every `-fast`
+failover failed closed as `lithos_upstream_invalid_response` (502). A response naming the sibling with no failover
+behind it is still rejected, and the client-facing model id stays the one requested.
+
+### Why
+
+The owner asked for the routing to return to Ultra once the header's reset time passes, and for the change to stay
+scoped to LithosAI and to the Ultra tier. The echo allowance is needed because `-ultra-chat` folded onto
+`/models/DeepSeek-V4.1-Flash` and passed the unchanged guard, while `-fast` self-echoes (both probed 2026-09-24).
+
+### Status
+
+Implemented in `src/provider/lithos-rate-limits.ts` (the windows), `src/provider/lithos.ts` (the scoped echo acceptance,
+threaded through the buffered and streamed readers) and `src/provider/lithos-handlers.ts` (window-aware dispatch), with
+coverage in `tests/lithos-wiring.test.ts`. Merged as PR #506 (`3df84b307`) and deployed to both surfaces -
+`mac-3df84b307a70906231262d80a0f608a8b9d97770` and `vps-3df84b307a70906231262d80a0f608a8b9d97770` - both
+health-verified, with the public `/health` carrying the full SHA in its body and identity headers.
+
+Live acceptance 2026-09-24 20:45-20:46Z on the Mac gateway: a 70-way concurrent Ultra burst saturated both tiers - every
+refused request was retried on `-fast` (failover lines recording `sibling_model` `-fast`, `rate_limit_failover_model` on
+the terminals, `rate_limit_wait_ms: null` throughout) and the 17 requests that outlived both buckets were relayed as the
+vendor's own 429 rather than waited for; the following 30-way burst was served 30/30, with 13 of them dispatched
+straight to `-fast` from the window this burst had opened; and the first probe after the vendor's reset instant was
+dispatched to Ultra again with no failover line.
+
+## 2026-09-24 — The Ultra refusal target moves from `-ultra-chat` to `-fast`
+
+### Decision
+
+A `429` on `deepseek-ai/DeepSeek-V4.1-Flash-ultra` now load-balances that single request onto
+`deepseek-ai/DeepSeek-V4.1-Flash-fast` instead of `-ultra-chat`. Nothing else changes: one immediate retry, the vendor's
+own refusal relayed when the target refuses too, and no waiting unless `LITHOSAI_RATE_LIMIT_WAIT` is set on the host.
+
+### Why
+
+LithosAI told the owner on 2026-09-24 that `-ultra-chat` is tuned for short context windows and loses accuracy on the
+large-context sessions this route serves, and recommended the `-fast` tier instead. Probed against the live vendor the
+same day, before wiring it: `-fast` reports its own `x-ratelimit-remaining-*` counters (independent of ultra's), accepts
+`reasoning_effort` none..max with `reasoning_content` on the wire, returns `get_weather` tool calls, and answered a
+needle prompt at 106,403 prompt tokens correctly.
+
+### Status
+
+Implemented in `src/provider/lithos-rate-limits.ts` (the sibling map) with coverage in `tests/lithos-wiring.test.ts`;
+this supersedes the Ultra mapping in the entry below. Merged as PR #505 (`4ef4a55ff`) and superseded within the hour by
+PR #506 (`3df84b307`), which added the sticky window and the scoped sibling-echo acceptance this mapping needs - without
+it a `-fast` failover failed closed as `lithos_upstream_invalid_response` (502) because the vendor self-echoes the
+`-fast` id. Both surfaces now run `3df84b307a70906231262d80a0f608a8b9d97770`.
+
+## 2026-09-24 — A LithosAI refusal is load-balanced onto the sibling tier, and waiting is opt-in
+
+### Decision
+
+The direct LithosAI route no longer waits out a rate-limit window by default. A `429` on the requested tier immediately
+retries that single request against the tier's configured sibling - `deepseek-ai/DeepSeek-V4.1-Flash-ultra` to
+`deepseek-ai/DeepSeek-V4.1-Flash-ultra-chat` - and, if the sibling refuses too, relays the refusal with the vendor's own
+status, code and rate-limit headers. No pause, no keepalive hold, no deferred stream, no jitter, no attempt budget, and
+no streamed five-minute window.
+
+Waiting is now a switch: with `LITHOSAI_RATE_LIMIT_WAIT` set to a truthy value on a host, a refusal whose own headers
+name a retry window (`retry-after-ms`, then `retry-after`, then the later `x-ratelimit-reset-*` refill delta) is waited
+out and the same model id retried, bounded at 75 s per attempt, 90 s in total and three dispatches per request. The
+window is waited inline on both routes, and `rate_limit_wait_ms` is reported only when the switch waits.
+
+### Why
+
+The two ids are the same 552B weights behind separate per-model rate-limit buckets, so one immediate load-balance
+attempt costs nothing and needs no clock; the owner asked for that simplification on 2026-09-24 and for the header-timed
+retry to stay available behind an explicit switch rather than as the default.
+
+### Status
+
+Implemented in `src/provider/lithos-rate-limits.ts` (sibling map, header parsing, caps, opt-in switch),
+`src/provider/lithos-handlers.ts` (failover-then-relay dispatch loop) and `src/provider/stream-relay.ts` (the
+pending-source contract the deferred wait needed is gone), with coverage in `tests/lithos-wiring.test.ts`. Supersedes
+the 2026-09-24 wait entries below for the default behavior; their sibling mapping, header precedence, telemetry names
+and safety caps are retained.
+
+## 2026-09-24 — An Ultra refusal fails over once per request to the sibling tier's own bucket
+
+### Decision
+
+When the requested LithosAI tier refuses a request with 429, the gateway first tries that tier's configured sibling -
+the same weights served under a separate per-model rate-limit bucket - for that request, before any wait. The mapping is
+one pair, `deepseek-ai/DeepSeek-V4.1-Flash-ultra` to `deepseek-ai/DeepSeek-V4.1-Flash-ultra-chat`; a model with no
+configured sibling keeps the wait-only behavior. The sibling is tried at most once per request, only after the requested
+tier itself refused, and only when every attempt so far addressed the requested tier. If the sibling also refuses, the
+wait policy applies to the sibling - behind the open stream for streamed requests.
+
+The client's requested model id is never rewritten, the substitution is announced by `lithos_rate_limit_failover` and
+recorded as `rate_limit_failover_model` on the request terminal, and the vendor's own model identity stays on the wire.
+Failover is deliberately per request and one-way: it buffers a saturated bucket instead of changing any client's
+configured model.
+
+### Why
+
+Probed 2026-09-24 against the live vendor and through this gateway: the two ids are the same 552B weights behind
+independent `x-ratelimit-remaining-*` counters, and `-ultra-chat` returned the identical `get_weather` tool call on the
+raw wire and on both gateway routes (`/v1/chat/completions` and a streamed `/v1/responses` with `reasoning.effort: max`,
+ending in `response.completed` with a `function_call` item). A refusal on one tier therefore says nothing about the
+other, and a coding turn that would otherwise wait out a saturated window can be served immediately from the sibling's
+bucket.
+
+### Status
+
+Implemented in `src/provider/lithos-rate-limits.ts` (sibling map, failover logging, `rate_limit_failover_model`
+telemetry) and `src/provider/lithos-handlers.ts` (the failover step in the dispatch loop), with coverage in
+`tests/lithos-wiring.test.ts`. Merged as PR #501 (`3848c94ca`) and deployed to both surfaces -
+`vps-3848c94cabed64590d8bf462636defb2685f1429` and `mac-3848c94cabed64590d8bf462636defb2685f1429` - both
+health-verified.
+
+Live acceptance 2026-09-24 15:20Z on the VPS: a 96-way concurrent Ultra burst over the loopback produced 54
+`lithos_rate_limit_failover` events and 54 terminals served by `deepseek-ai/DeepSeek-V4.1-Flash-ultra-chat` - every
+failover recovered - alongside 42 absorbed waits. The 30 requests that still ended 429 were that burst saturating both
+tiers (96 requests against two 60-request buckets) and exhausting the wait budget. A public authenticated streamed
+`/v1/responses` with tools and `reasoning.effort: max` returned a `get_weather` `function_call` and `response.completed`
+on the same release.
+
+## 2026-09-24 — A streamed LithosAI refusal is absorbed for up to five minutes behind the open stream
+
+### Decision
+
+A streamed request that meets a LithosAI 429 with a waitable window no longer waits silently before its response begins.
+The handler opens the SSE stream first, and the wait plus its retries run behind it while the gateway's standard
+`: keepalive` frames hold the client. The streamed wait policy is a five-minute total budget, the same 75-second
+per-attempt cap, and a 20-dispatch safety cap. Buffered requests keep the previous policy (75 s per attempt, 90 s total,
+three dispatches), because nothing can hold a silent buffered response through an edge proxy's read bound.
+
+If the streamed budget is spent, the refusal travels in-band with the vendor's own code (`rate_limit_exceeded`, or
+`provider_overloaded` at capacity) in the Responses `response.failed` terminal or the Chat error frame, since a status
+can no longer be returned. A cancellation or a gateway deadline that ends a wait keeps its own terminal and emits no
+error frame. Every absorbed wait is reported as `rate_limit_wait_ms` on the request terminal.
+
+### Why
+
+Production evidence from 2026-09-24 08:46-08:50Z: a VPS Codex session failed with
+`exceeded retry limit, last status: 429 Too Many Requests` while the same window logged 18 waits and 46 served Ultra
+requests. The organization-wide, per-model bucket was saturated for about three and a half minutes - longer than the
+previous 90-second budget - so one request relayed a 429 and the client's own four-retry limit then failed the turn.
+Client tolerance is about ten minutes, so absorbing the window is the difference between one slow request and one failed
+agent turn.
+
+### Status
+
+Implemented in `src/provider/lithos-handlers.ts` (streamed wait policy and pending dispatch),
+`src/provider/lithos-rate-limits.ts` (the policy, header parsing and wait) and `src/provider/stream-relay.ts`
+(pending-source support and in-band refusal reporting), with `rate_limit_wait_ms` in the request telemetry and terminal
+log. Merged as PR #501 (`3848c94ca`) and deployed to both surfaces at `3848c94cabed64590d8bf462636defb2685f1429`,
+health-verified.
+
+Live acceptance 2026-09-24 15:20Z on the VPS: the same 96-way Ultra burst logged 42 absorbed waits while 66 requests
+were served. The same day's 08:46-08:50Z window - 18 waits and 46 served Ultra requests, then one request outliving the
+previous 90-second budget and failing a client turn - is the case this entry exists to remove.
+
+## 2026-09-24 — LithosAI rate-limit refusals are waited out and retried on the same model id
+
+### Decision
+
+A `429` from the direct LithosAI route is no longer relayed immediately when the vendor's own retry hints name a window
+the gateway can wait out. The gateway waits for that window and retries the SAME model id on the same provider, bounded
+at 75 s per attempt, 90 s in total and at most three dispatches per request, with abort-aware sleeping and a small
+jitter so requests refused the same window do not retry in lockstep.
+
+The wait is derived in the vendor's own precedence: `retry-after-ms`, then `retry-after` (seconds or HTTP date), then
+the later of the two `x-ratelimit-reset-*` refill deltas. A refusal that names no window, a refusal carrying
+`x-should-retry: false`, a window beyond the caps, or an exhausted attempt budget is relayed unchanged with the vendor's
+status, its `rate_limit_exceeded` / `provider_overloaded` code and its rate-limit headers. No other provider or model is
+ever substituted, and a LithosAI 429 still never advances the Codex -> Surplus -> OpenLux waterfall: this is a retry of
+the pinned route, not a failover.
+
+Both LithosAI streamed routes now also carry the gateway's standard `: keepalive` SSE comment frames.
+
+### Why
+
+The vendor's limits are per-minute budgets per model shared by the whole organization (probed 2026-09-24: 60
+requests/min and 4,000,000 tokens/min on the ultra tier), while one Codex or DSH step sends roughly 150k input tokens,
+so ordinary fan-out trips the org input-token budget mid-step. The observed refusals carry a short refill delta
+(`x-ratelimit-reset-tokens: 3.23s`), so failing the request instead of waiting for the refill throws away a whole agent
+step for a pause measured in seconds. Before this entry a pinned direct provider had no retry seam at all, and the
+refusal reached the client as a terminal `response.failed`.
+
+### Status
+
+Implemented in `src/provider/lithos-handlers.ts` (wait policy and wait-aware dispatch loop), `src/provider/lithos.ts`
+(route comment) and later split with the policy moving to `src/provider/lithos-rate-limits.ts`, with coverage in
+`tests/lithos-wiring.test.ts`. Merged as PR #500 (`aac3b2c31`) and deployed from there; superseded on 2026-09-24 by PR
+#501 (`3848c94ca`), which raises the streamed budget and adds the sibling failover. Both surfaces currently run
+`3848c94cabed64590d8bf462636defb2685f1429`.
+
 ## 2026-09-22 — Reinstate a finite process-resource guard, narrowly superseding the 2026-08-25 admission ban
 
 ### Decision
@@ -231,3 +433,85 @@ subscriptions keeps neither cache warm and obscures which subscription is degrad
 Restoring a retired per-key affinity override, load-balancing across subscriptions while the active one still has
 capacity, or reordering the provider chain all reintroduce the cache and account-health problem this decision removed.
 Do not make the order dynamic without a new dated entry.
+
+## 2026-09-25 — LithosAI refusals have one behaviour (owner decision)
+
+A refusal on the LithosAI route now has exactly one shape: the refused request is retried once on the tier's configured
+sibling (`deepseek-ai/DeepSeek-V4.1-Flash-ultra` → `deepseek-ai/DeepSeek-V4.1-Flash-fast`), and a refusal whose own
+headers name a reset instant keeps later requests on that sibling until the instant passes, after which the requested
+tier is tried again. A refusal that names no window is relayed once both tiers have refused.
+
+Removed in the same change: the `LITHOSAI_RATE_LIMIT_WAIT` opt-in that waited out a window and retried the same model
+id, together with its caps and telemetry hooks. The owner asked for the simplest possible policy and confirmed the Codex
+iOS client cannot read response headers, so substitution is not signalled on the response.
+
+Reversal risk: restoring the wait switch, capping the sibling window with an invented duration, or adding a header-based
+signal all reintroduce behaviour the owner's client cannot see or act on. Change this only with a new dated entry.
+
+## 2026-09-25 — A streamed LithosAI refusal is absorbed behind the open stream again (five-minute budget)
+
+A streamed Responses request that meets a refusal on both tiers no longer waits silently up to the buffered cap and then
+relays. It opens its SSE response immediately, holds the client with the gateway's standard `: keepalive` frames, and
+spends the vendor's own windows behind it: up to five waits totalling 300 seconds, the same 75-second per-wait cap, and
+one sibling failover per round. If the budget is exhausted the vendor's refusal travels in-band as the stream's
+`response.failed` terminal; a cancellation or gateway deadline keeps its own terminal and emits no error frame. Buffered
+requests keep the smaller silent budget (two waits, 120 seconds), because nothing can hold a silent buffered response
+through an edge proxy's read bound.
+
+Why this returns: on 2026-09-25 the iOS client's `exceeded retry limit, last status: 429` was traced to the Mac
+companion gateway, which had never been updated past `mac-3df84b307` while the VPS carried the fixes; its log held 152
+relayed 429 terminals. The vendor's saturation windows measured three and a half minutes (2026-09-24 08:46-08:50Z and
+2026-09-25 04:04-04:07Z), which the buffered 120-second budget cannot cover. The 2026-09-24 decision (PR #501,
+`mac-`/`vps-3848c94ca`) absorbed five minutes behind the open stream; #509 removed it together with the wait switch.
+This entry restores the streamed half of that policy on top of #509's sibling-first behaviour and #511's header-driven,
+abort-aware waits, so both surfaces now share it unconditionally.
+
+Reversal risk: relaying a waitable refusal because a silent hold looks simpler reintroduces the client-visible 429 the
+streamed budget exists to remove; letting a buffered request hold silently that long reintroduces the edge read bound
+the split budget exists to avoid. Coverage: `tests/lithos-wiring.test.ts` asserts the streamed budget persists past the
+buffered caps, that exhaustion reports in-band, and that an unwaitable refusal still relays unchanged.
+
+## 2026-09-25 — The streamed absorb covers the Chat Completions route too
+
+The Mac companion gateway's own log reframed the case: of its 137 client-visible LithosAI 429s, 128 were on
+`/v1/chat/completions` (106 on `deepseek-ai/DeepSeek-V4.1-Flash`), the wire the agent harness workers use, against 9 on
+the Responses wire. The deferred streamed absorb therefore applies to the Chat route as well: the stream opens first,
+`: keepalive` frames hold the client, the vendor's own windows are spent behind it under the same five-wait / 300-second
+budget and 75-second per-wait cap, and an exhausted budget reports the refusal in-band as the Chat error frame.
+`relayChatCompletionStream` accepts a pending upstream like `relayResponsesStream`, and the served tier is read after
+the deferred attempt lands.
+
+Reversal risk: leaving the Chat route on the buffered-only budget restores the client-visible 429s its own surface
+logged most often; opening the stream without the in-band refusal terminal would turn a spent budget into a silent hang.
+Coverage: `tests/lithos-wiring.test.ts` asserts the Chat budget past the buffered caps and the in-band exhaustion
+terminal.
+
+## 2026-09-25 — LithosAI failover walks the whole ladder, and a streamed refusal never returns an HTTP 429
+
+Two changes close the client-visible 429 class on this route. First, the single sibling hop becomes an ordered ladder:
+`-ultra` refuses -> `-fast` is tried -> the family's normal tier is tried, and each rung carries its own
+4,000,000-token/minute bucket (probed live 2026-09-25: consuming 250,006 tokens on `-fast` left `-ultra` reporting
+`remaining-tokens: 4000000`), so every hop moves real capacity, not just a label. The sticky window now carries its
+target and deepens on each refusal, so a later request resumes at the rung the vendor last refused past instead of
+bouncing back to a saturated tier. Kimi K3 gets the same ladder; `-ultra-chat` stays out for the recorded accuracy
+reason.
+
+Second, a streamed request can no longer receive an HTTP 429 from this route at all. When the ladder is exhausted (or
+the vendor says do not retry), the handler opens the stream and reports the refusal in-band as `response.failed` with
+the vendor's own code and message. Codex's `exceeded retry limit, last status: 429` banner requires an HTTP 429, so on
+the streamed wires this route cannot produce it any more; buffered requests keep the status because no stream exists to
+carry the terminal.
+
+Why: the 2026-09-25 incidents showed the banner arriving on both the Responses wire (9 events) and the Chat wire (128
+events) while the absorb was bounded or absent, and the earlier single-hop ladder assumed a shared bucket that the live
+probe refutes. Reversal risk: collapsing the ladder back to one hop re-shares the saturation across tiers; returning a
+status for a streamed refusal restores the banner and the client's pointless retry loop. Coverage:
+`tests/lithos-wiring.test.ts` asserts the full descent, the deepening sticky window, in-band refusals on both wires, and
+the buffered status path.
+
+## Independent Lithos tier refusal windows - 2026-10-03
+
+A refusal deadline belongs to the refused rung of the requested model ladder. New refusals extend only that rung’s
+unexpired deadline, and selection chooses the highest eligible rung in the existing ladder. Each rung recovers at its
+own reset; preserve native deadline and caller-cancellation reasons, bounded opt-in waits, and the existing provider
+waterfall.

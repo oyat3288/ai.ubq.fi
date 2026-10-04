@@ -3,6 +3,8 @@ export type CodexAuthState = Readonly<{
   refresh_token: string;
   account_id: string;
   updated_at_ms: number;
+  /** Local native Codex owns this account's rotating credential lineage. */
+  native_owner?: Readonly<{ codex_home: string; generation_hash: string; native_refreshed_at?: string }>;
 }>;
 
 export type CodexAuthPoolState = Readonly<{
@@ -140,7 +142,7 @@ export type ApiKeyUsageRequestV3 = Readonly<{
   state: "reserved" | "dispatched" | "released";
   reserved_at_ms: number;
   lease_expires_at_ms: number;
-  provider: "cerebras" | "chatgpt_codex" | "deepseek" | "removed_provider" | "metered" | "surplus" | "voyage" | null;
+  provider: "cerebras" | "chatgpt_codex" | "deepseek" | "lithos" | "openrouter" | "removed_provider" | "metered" | "surplus" | "voyage" | null;
   dispatched_at_ms: number | null;
   released_at_ms: number | null;
   release_reason: string | null;
@@ -167,7 +169,7 @@ export type ApiKeyRequestLogRecord = Readonly<{
   model: string | null;
   reasoning: string | null;
   created_at_ms: number;
-  provider: "cerebras" | "chatgpt_codex" | "deepseek" | "voyage" | PaidFallbackProvider;
+  provider: "cerebras" | "chatgpt_codex" | "deepseek" | "lithos" | "openrouter" | "voyage" | PaidFallbackProvider;
   fallback_reason: string | null;
   provider_request_id: string | null;
   completed_at_ms: number | null;

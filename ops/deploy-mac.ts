@@ -1,4 +1,6 @@
 // Run from the canonical Mac checkout after committing the candidate.
+import { pruneReleases } from "./release-retention.ts";
+import { prepareMacRuntime } from "./mac-runtime.ts";
 if (Deno.build.os !== "darwin") throw new Error("This deployment requires macOS");
 const root = await Deno.realPath(".");
 if (root !== "/Users/nv/repos/ubiquity/ai.ubq.fi") throw new Error("Run from the canonical Mac repository root");
@@ -10,33 +12,13 @@ async function command(program: string, args: string[]): Promise<string> {
   if (!result.success) throw new Error(`${program} failed: ${new TextDecoder().decode(result.stderr)}`);
   return new TextDecoder().decode(result.stdout).trim();
 }
-/**
- * Registers the scheduled Codex auth repair agent. The plist is symlinked from
- * the checkout so its command stays reviewable in Git, and `launchctl` needs an
- * explicit bootout because it caches the plist content at bootstrap time.
- */
-async function installRepairAgent(domain: string, repositoryRoot: string): Promise<void> {
-  const label = "com.ubiquity.ai.codex-auth-repair";
-  const link = `/Users/nv/Library/LaunchAgents/${label}.plist`;
-  const source = `${repositoryRoot}/ops/${label}.plist`;
-  try {
-    const target = await Deno.readLink(link);
-    if (target !== source) throw new Error("An unrelated launch agent owns this path");
-  } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
-    await Deno.symlink(source, link);
-  }
-  const service = `${domain}/${label}`;
-  const registered = await new Deno.Command("launchctl", { args: ["print", service], stdout: "null", stderr: "null" }).output();
-  if (registered.success) await command("launchctl", ["bootout", service]);
-  await command("launchctl", ["bootstrap", domain, link]);
-}
 try {
   if (await command("git", ["status", "--porcelain", "--untracked-files=no"])) {
     throw new Error("Preserve tracked changes before deployment");
   }
   const sha = await command("git", ["rev-parse", "HEAD"]);
   if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("A full Git revision is required");
+  await prepareMacRuntime(root);
   const release = `.data/releases/${sha}`;
   try {
     await Deno.stat(release);
@@ -95,17 +77,15 @@ try {
         response.headers.get("x-uos-git-sha") === sha &&
         response.headers.get("x-uos-deployment-id") === `mac-${sha}`
       ) {
-        // The repair agent is a scheduled companion, so a registration problem
-        // must not turn a verified service deployment into a failed one. The
-        // result is reported, and the next deployment retries the registration.
-        let repairAgent = "installed";
+        // Retention runs only after the release is proven live, and a pruning fault must not
+        // turn a verified deployment into a failed one: the next deployment retries it.
+        let releasesPruned: number | "failed" = "failed";
         try {
-          await installRepairAgent(domain, root);
+          releasesPruned = (await pruneReleases()).removed.length;
         } catch (error) {
-          repairAgent = "failed";
-          console.error(`[deploy-mac] Codex auth repair agent was not registered: ${error instanceof Error ? error.message : String(error)}`);
+          console.error(`[deploy-mac] Release retention was not applied: ${error instanceof Error ? error.message : String(error)}`);
         }
-        console.log(JSON.stringify({ git_sha: sha, deployment_id: `mac-${sha}`, health_verified: true, repair_agent: repairAgent }));
+        console.log(JSON.stringify({ git_sha: sha, deployment_id: `mac-${sha}`, health_verified: true, releases_pruned: releasesPruned }));
         Deno.exit(0);
       }
     } catch {

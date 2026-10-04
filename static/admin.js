@@ -23,7 +23,7 @@ import { createAdminSnapshotCache } from "./admin-cache.js?v=admin-indexeddb-cac
 import { bindForegroundRefresh } from "./foreground-refresh.js";
 import { setReasoningPlaceholder, updateReasoningSelectForModel } from "./reasoning-select.js";
 import { toast } from "./toast.js?v=passport-design-20260922";
-import { createSupervisorView } from "./admin-supervisor.js";
+import { createSupervisorView } from "./admin-supervisor.js?v=20261001-supervisor-v4";
 
 const STORAGE_KEYS = {
   rememberToken: AUTH_STORAGE_KEYS.rememberToken,
@@ -214,6 +214,7 @@ const viewModels = mustGet("view-models");
 const viewSupervisor = mustGet("view-supervisor");
 const errorsBadge = mustGet("errors-badge");
 const errorsUpdated = mustGet("errors-updated");
+const errorsRetention = mustGet("errors-retention");
 const errorsList = mustGet("errors-list");
 
 const modelsWhitelistSave = mustGet("models-whitelist-save");
@@ -231,7 +232,7 @@ const modelsMetadataRefreshBtn = mustGet("models-metadata-refresh");
 const modelsSummary = mustGet("models-whitelist-summary");
 const modelsWarning = mustGet("models-whitelist-warning");
 const modelsList = mustGet("models-whitelist-list");
-const modelsProviderButtons = [...document.querySelectorAll("[data-model-provider]")];
+const modelsProviderFilters = document.querySelector("[data-model-filters]");
 
 const providersSelectionSave = mustGet("providers-selection-save");
 const providersSelectionBadge = mustGet("providers-selection-badge");
@@ -247,18 +248,12 @@ const providersReloadBtn = mustGet("providers-selection-reload");
 const providersSummary = mustGet("providers-selection-summary");
 const providersWarning = mustGet("providers-selection-warning");
 const providersList = mustGet("providers-selection-list");
-const providersTierButtons = [...document.querySelectorAll("[data-provider-tier]")];
+const providersTierFilters = document.querySelector("[data-provider-filters]");
 
 const providerCapacityBadge = mustGet("provider-capacity-badge");
 const providerCapacityUpdated = mustGet("provider-capacity-updated");
 const providerCapacityChart = mustGet("provider-capacity-chart");
 const providerCapacityList = mustGet("provider-capacity-list");
-
-const quotaRunwayBadge = mustGet("quota-runway-badge");
-const quotaRunwayUpdated = mustGet("quota-runway-updated");
-const quotaRunwaySummary = mustGet("quota-runway-summary");
-const quotaRunwayList = mustGet("quota-runway-list");
-const quotaRunwayNote = mustGet("quota-runway-note");
 
 let currentKeyView = "active";
 let currentAdminView = "loading";
@@ -279,10 +274,6 @@ let providersLoadedAt = 0;
 let providerCapacityLoading = false;
 let providerCapacityLoadedAt = 0;
 let providerCapacityLoadedForOpen = false;
-let quotaProjectionLoading = false;
-let quotaProjectionLoadedAt = 0;
-let quotaProjectionLoadedForOpen = false;
-let quotaProjectionLoadId = 0;
 let latestProviderCapacityChartState = null;
 let capacityChartResizeFrame = 0;
 let capacityChartScrollState = null;
@@ -1005,18 +996,22 @@ const capacityProviderStatus = (source, provider) => {
   const health = provider?.health ?? provider ?? null;
   const state = provider?.configured === false ? "unconfigured" : health?.state;
   const hasState = typeof state === "string" && state.trim().length > 0;
+  const quotaReachable = source.source === "codex" && source.state === "available" &&
+    health?.last_event === "reachable" && health.last_status === 200 && health.stale === false &&
+    provider?.access_token_expired === false && provider.access_token_exp_ms > Date.now();
   let badgeState = capacityBadgeState(source.state);
-  if (hasState) {
+  if (hasState && !quotaReachable) {
     badgeState = providerBadgeState(state);
     if (source.state !== "available" && badgeState === "ok") badgeState = "unknown";
   }
-  const healthLabel = hasState ? providerStateLabel({ ...health, state }) : "";
+  const healthLabel = quotaReachable ? "Reachable" : hasState ? providerStateLabel({ ...health, state }) : "";
   return {
     badgeState,
     label: healthLabel && healthLabel !== "unknown"
       ? `${healthLabel} · ${capacityStateLabel(source.state)}`
       : capacityStateLabel(source.state),
     health,
+    quotaReachable,
   };
 };
 
@@ -1036,11 +1031,13 @@ const appendCapacitySourceMeta = (row, source, provider = null) => {
     appendProviderFact(facts, "Token expires", formatDate(provider?.access_token_exp_ms));
     appendProviderFact(
       facts,
-      "Refresh",
+      "Last refresh attempt",
       health.last_refresh_succeeded === true
         ? `Succeeded · ${formatDate(health.last_refresh_at_ms)}`
         : health.last_refresh_succeeded === false
-        ? `Failed · ${formatDate(health.last_refresh_at_ms)}`
+        ? `Failed · ${formatDate(health.last_refresh_at_ms)}${
+          capacityProviderStatus(source, provider).quotaReachable ? " · Quota reads currently succeed" : ""
+        }`
         : "Not observed",
     );
   } else if (source.source === "metered") {
@@ -1153,85 +1150,6 @@ const renderCodexCapacitySource = (source, provider = null) => {
   return row;
 };
 
-const renderMeteredCapacitySource = (source, provider = null) => {
-  const row = document.createElement("div");
-  row.dataset.capacitySource = "metered";
-  row.dataset.state = source.state;
-  row.setAttribute("role", "listitem");
-
-  const header = document.createElement("header");
-  const title = document.createElement("h3");
-  title.textContent = "Metered 2";
-  const badge = document.createElement("span");
-  badge.dataset.badge = "";
-  const status = capacityProviderStatus(source, provider);
-  setBadge(badge, status.badgeState, status.label);
-  header.append(title, badge);
-
-  const facts = document.createElement("dl");
-  facts.dataset.capacityFacts = "";
-  const wallet = source.wallet ?? {};
-  // The OpenLux token endpoint is not a wallet: `unlimited_quota` is a
-  // token-scope flag and its granted/available/used totals do not track the
-  // real balance, so none of them are displayed as a balance. The actionable
-  // signal is the provider's last outcome from real inference traffic, which is
-  // shown first.
-  appendProviderFact(facts, "Inference", status.health ? providerStateLabel(status.health) : "Not observed");
-  appendProviderFact(facts, "Last response", formatDate(status.health?.last_observed_at_ms));
-  appendProviderFact(facts, "Balance", "Not reported by provider");
-  appendProviderFact(
-    facts,
-    "Refill remaining",
-    formatCapacityPercent(wallet.refill_cycle_remaining_percent),
-  );
-  appendProviderFact(
-    facts,
-    "Refill baseline",
-    wallet.baseline_credits === null || wallet.baseline_credits === undefined
-      ? "Not available"
-      : formatCredits(wallet.baseline_credits),
-  );
-  appendProviderFact(facts, "Confidence", wallet.confidence ?? "Not available");
-  appendProviderFact(facts, "Cycle started", formatCapacityTimestamp(wallet.cycle_started_at_ms));
-  appendProviderFact(facts, "Reset", "Not provided for refill cycle");
-  row.append(header, facts);
-  appendCapacitySourceMeta(row, source, provider);
-  const diagnostics = row.querySelector("details");
-  const secondaryFacts = document.createElement("dl");
-  secondaryFacts.dataset.capacityFacts = "";
-  secondaryFacts.append(...Array.from(facts.children).slice(1));
-  diagnostics.appendChild(secondaryFacts);
-  return row;
-};
-
-const renderSurplusProviderHealthSource = (provider = null) => {
-  const row = document.createElement("div");
-  row.dataset.capacitySource = "surplus";
-  row.dataset.state = provider?.configured === false ? "unavailable" : provider?.health?.state ?? "unknown";
-  row.setAttribute("role", "listitem");
-
-  const header = document.createElement("header");
-  const title = document.createElement("h3");
-  title.textContent = "Metered 1";
-  const badge = document.createElement("span");
-  badge.dataset.badge = "";
-  const configured = provider?.configured === true;
-  const state = configured ? provider?.health?.state ?? "unknown" : "unconfigured";
-  setBadge(
-    badge,
-    configured ? providerBadgeState(state) : "bad",
-    configured ? providerStateLabel(provider?.health) : "Not configured",
-  );
-  header.append(title, badge);
-
-  const facts = document.createElement("dl");
-  facts.dataset.capacityFacts = "";
-  appendProviderFact(facts, "Last response", formatDate(provider?.health?.last_observed_at_ms));
-  appendProviderFact(facts, "Quota", provider?.quota?.available === true ? "Reported" : "Not reported");
-  row.append(header, facts);
-  return row;
-};
-
 const providerForCodexSlot = (slot) => {
   const accounts = Array.isArray(latestProviderHealth?.codex?.accounts) ? latestProviderHealth.codex.accounts : [];
   return accounts.find((account) => String(account?.slot) === String(slot)) ?? null;
@@ -1241,14 +1159,7 @@ const renderProviderCapacityList = (sources) => {
   const expanded = Array.from(providerCapacityList.children, (row) => row.querySelector("details")?.open === true);
   providerCapacityList.replaceChildren();
   for (const source of sources) {
-    providerCapacityList.appendChild(
-      source.source === "metered"
-        ? renderMeteredCapacitySource(source, latestProviderHealth?.metered)
-        : renderCodexCapacitySource(source, providerForCodexSlot(source.slot)),
-    );
-  }
-  if (latestProviderHealth?.surplus) {
-    providerCapacityList.appendChild(renderSurplusProviderHealthSource(latestProviderHealth.surplus));
+    providerCapacityList.appendChild(renderCodexCapacitySource(source, providerForCodexSlot(source.slot)));
   }
   Array.from(providerCapacityList.children).forEach((row, index) => {
     const details = row.querySelector("details");
@@ -1256,32 +1167,14 @@ const renderProviderCapacityList = (sources) => {
   });
 };
 
-const unavailableCapacitySource = (source, slot = null) =>
-  source === "metered"
-    ? {
-      source: "metered",
-      state: "unavailable",
-      source_observed_at_ms: null,
-      snapshot_at_ms: null,
-      wallet: {
-        balance_credits: null,
-        baseline_credits: null,
-        refill_cycle_remaining_percent: null,
-        refill_cycle_used_percent: null,
-        cycle_started_at_ms: null,
-        last_credit_at_ms: null,
-        confidence: null,
-        cache_state: null,
-      },
-    }
-    : {
-      source: "codex",
-      slot,
-      state: "unavailable",
-      source_observed_at_ms: null,
-      snapshot_at_ms: null,
-      windows: { primary: null, secondary: null },
-    };
+const unavailableCodexCapacitySource = (slot) => ({
+  source: "codex",
+  slot,
+  state: "unavailable",
+  source_observed_at_ms: null,
+  snapshot_at_ms: null,
+  windows: { primary: null, secondary: null },
+});
 
 const CAPACITY_CHART_SVG_NS = "http://www.w3.org/2000/svg";
 const CAPACITY_CHART_MIN_DAYS = 7;
@@ -1318,7 +1211,6 @@ const CAPACITY_CHART_DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 });
 const CAPACITY_CHART_SERIES = [
   { key: "available-capacity", label: "Codex capacity", source: "aggregate" },
-  { key: "metered-refill", label: "Metered 2 refill", source: "metered", valueKey: "refill_cycle_remaining_percent" },
 ];
 
 const capacityChartFailureIsDowntime = (source) =>
@@ -1468,8 +1360,8 @@ const capacityChartPlotHeight = () => {
   return CAPACITY_CHART_PLOT_HEIGHT * pixelsPerPercent;
 };
 
-// Keep the Codex pool and Metered wallet on separate series. Their percentages
-// use different quota systems and must not be averaged into one value.
+// The aggregate series blends only Codex pool window percentages; percentages
+// from other quota systems must never be averaged into Codex capacity.
 const capacityChartCodexAggregateRemainingPercent = (sample) => {
   const sources = Array.isArray(sample?.sources) ? sample.sources : [];
   const remaining = [];
@@ -2205,7 +2097,7 @@ const renderProviderCapacityChart = (snapshot, sources, fiveXxBuckets = []) => {
     preserveAspectRatio: "xMinYMin meet",
     role: "img",
     "aria-label":
-      "Codex and Metered 2 provider capacity lines and cached input percentage bars over the trailing seven days, including rate-limit resets, provider downtime, and failed inference response markers",
+      "Codex provider capacity lines and cached input percentage bars over the trailing seven days, including rate-limit resets, provider downtime, and failed inference response markers",
     focusable: "false",
   });
   svg.dataset.capacityChartSvg = "";
@@ -2685,7 +2577,6 @@ const renderProviderCapacityChart = (snapshot, sources, fiveXxBuckets = []) => {
   const samples = history.filter((sample) => typeof sample?.sampled_at_ms === "number");
   const staleNotes = [
     sources.some((source) => source?.source === "codex" && source?.state === "stale") ? "Codex samples stale" : null,
-    sources.some((source) => source?.source === "metered" && source?.state === "stale") ? "Metered sample stale" : null,
   ].filter((note) => note !== null);
   const staleSuffix = staleNotes.length ? ` · ${staleNotes.join(" · ")}` : "";
   const resetEvents = Array.isArray(snapshot?.reset_events) ? snapshot.reset_events : [];
@@ -2742,12 +2633,8 @@ const renderProviderCapacity = (snapshot, fiveXxBuckets = []) => {
   const rawSources = Array.isArray(snapshot?.sources) ? snapshot.sources : [];
   const sourceForSlot = (slot) =>
     rawSources.find((source) => source?.source === "codex" && source.slot === slot) ??
-      unavailableCapacitySource("codex", slot);
-  const sources = [
-    sourceForSlot(1),
-    sourceForSlot(2),
-    rawSources.find((source) => source?.source === "metered") ?? unavailableCapacitySource("metered"),
-  ];
+      unavailableCodexCapacitySource(slot);
+  const sources = [sourceForSlot(1), sourceForSlot(2)];
   latestProviderCapacityChartState = { snapshot, sources, fiveXxBuckets };
   renderProviderCapacityChart(snapshot, sources, fiveXxBuckets);
   renderProviderCapacityList(sources);
@@ -2817,236 +2704,6 @@ const loadProviderCapacity = async () => {
     return false;
   } finally {
     providerCapacityLoading = false;
-  }
-};
-
-const quotaProjectionProviderLabel = (provider) =>
-  provider === "surplus" ? "Surplus" : provider === "metered" ? "Metered" : String(provider ?? "unknown");
-
-const quotaProjectionDuration = (ms) => {
-  if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return "unknown";
-  const minutes = Math.max(0, Math.trunc(ms / 60_000));
-  if (minutes < 60) return `${formatNumber(minutes)}m`;
-  const hours = Math.trunc(minutes / 60);
-  const days = Math.trunc(hours / 24);
-  if (days >= 365) return `${Math.round(days / 365 * 10) / 10}y`;
-  if (days >= 1) return `${formatNumber(days)}d ${hours % 24}h`;
-  return `${formatNumber(hours)}h ${minutes % 60}m`;
-};
-
-const quotaProjectionEstimate = (entry, windowDays = 30) => {
-  const estimate = (entry?.estimates ?? []).find((candidate) => candidate?.window_days === windowDays);
-  const usage = (entry?.usage ?? []).find((candidate) => candidate?.window_days === windowDays);
-  return { estimate, usage };
-};
-
-const renderQuotaProjectionRows = (payload, historyUnavailable) => {
-  const models = Array.isArray(payload?.models) ? payload.models : [];
-  quotaRunwayList.replaceChildren();
-  if (!models.length) {
-    const empty = document.createElement("p");
-    empty.dataset.empty = "quota-runway";
-    empty.textContent = historyUnavailable
-      ? "Paid-fallback usage history could not be read — check KV availability."
-      : "No settled paid-fallback usage in the retained window yet. Rows appear after requests settle.";
-    quotaRunwayList.appendChild(empty);
-    return;
-  }
-  for (const entry of models) {
-    const { estimate, usage } = quotaProjectionEstimate(entry, 30);
-    const row = document.createElement("div");
-    row.dataset.quotaRunwayRow = "";
-    const heading = document.createElement("div");
-    heading.dataset.quotaRunwayHeading = "";
-    const model = document.createElement("strong");
-    model.textContent = String(entry.model ?? "unknown");
-    const provider = document.createElement("span");
-    provider.dataset.muted = "";
-    provider.textContent = quotaProjectionProviderLabel(entry.provider);
-    heading.append(model, provider);
-    const details = document.createElement("div");
-    details.dataset.quotaRunwayDetails = "";
-    const history = document.createElement("p");
-    history.dataset.muted = "";
-    history.textContent = usage?.request_count
-      ? `30d: ${formatNumber(usage.request_count)} requests · ${
-        formatDecimal(usage.avg_quota_per_request)
-      } quota avg/request`
-      : "No settled usage in the trailing 30 days";
-    const projection = document.createElement("p");
-    if (!estimate) {
-      projection.textContent = "No exhaustion estimate — quota is not monitored for this provider";
-    } else if (estimate?.unlimited === true) {
-      // `unlimited` mirrors the token report's unlimited_quota flag, which is a
-      // token-scope flag rather than a funded wallet; it is never presented as
-      // an unlimited balance.
-      projection.textContent = "Balance not reported — no exhaustion estimate";
-    } else if (estimate?.requests_remaining === null || estimate?.requests_remaining === undefined) {
-      projection.textContent = "Exhaustion estimate unknown (no quota balance or usage rate)";
-    } else {
-      const parts = [`~${formatNumber(estimate.requests_remaining)} requests left`];
-      if (typeof estimate.time_remaining_ms === "number") {
-        parts.push(`~${quotaProjectionDuration(estimate.time_remaining_ms)} run-time left`);
-        if (typeof estimate.exhausted_at_ms === "number") {
-          parts.push(`exhausts ${formatDate(estimate.exhausted_at_ms)}`);
-        }
-      }
-      const knocked = estimate.percent_per_request_vs_balance;
-      if (typeof knocked === "number") {
-        parts.push(`${quotaPercentFormatter.format(knocked)}% of balance per request`);
-      }
-      if (estimate.stale_balance === true) parts.push("stale balance snapshot");
-      projection.textContent = parts.join(" · ");
-    }
-    details.append(history, projection);
-    row.append(heading, details);
-    quotaRunwayList.appendChild(row);
-  }
-};
-
-const renderQuotaProjection = (payload) => {
-  const quota = payload?.quota ?? {};
-  const balanceHistory = Array.isArray(payload?.balance_history) ? payload.balance_history : [];
-  quotaRunwaySummary.replaceChildren();
-  quotaRunwayNote.textContent = "";
-  if (!quota.available) {
-    setBadge(quotaRunwayBadge, "bad", "Quota not monitored");
-    quotaRunwayUpdated.textContent = "Consumption history only";
-    const summary = document.createElement("p");
-    summary.dataset.muted = "";
-    summary.textContent =
-      "Metered quota monitoring is not configured or has no snapshot. Per-model consumption history is still reported below.";
-    quotaRunwaySummary.appendChild(summary);
-  } else if (typeof quota.balance_credits !== "number") {
-    // The token endpoint is the only OpenLux balance surface, it only publishes
-    // an unlimited token-scope flag and totals that do not track the wallet,
-    // and inference responses carry no balance. No balance-based estimate can
-    // be honest here, so none is shown.
-    setBadge(quotaRunwayBadge, "unknown", "Balance not reported");
-    quotaRunwayUpdated.textContent = "No exhaustion estimate";
-    const summary = document.createElement("p");
-    summary.dataset.muted = "";
-    summary.textContent =
-      "OpenLux publishes no wallet balance: the token report's unlimited flag is a token-scope flag and its granted, available, and used totals do not track the real balance. Balance-based run-time estimates are unavailable.";
-    quotaRunwaySummary.appendChild(summary);
-  } else {
-    const balanceCredits = quota.balance_credits;
-    const baselineCredits = quota.baseline_credits;
-    const remainingPercent = quota.remaining_percent;
-    const balanceText = `Balance ${formatNumber(balanceCredits)} credits`;
-    setBadge(
-      quotaRunwayBadge,
-      balanceCredits > 0 ? "ok" : "bad",
-      balanceText,
-    );
-    const updatedParts = [];
-    if (typeof remainingPercent === "number") {
-      updatedParts.push(`${quotaPercentFormatter.format(remainingPercent)} of baseline left`);
-    }
-    if (typeof baselineCredits === "number" && baselineCredits !== 0) {
-      updatedParts.push(`baseline ${formatNumber(baselineCredits)} credits`);
-    }
-    if (typeof quota.observed_at_ms === "number") updatedParts.push(`observed ${formatDate(quota.observed_at_ms)}`);
-    quotaRunwayUpdated.textContent = updatedParts.join(" · ") || "Waiting for projection";
-    const refill = [];
-    if (typeof quota.latest_refill_amount_credits === "number") {
-      refill.push(`last refill ${formatNumber(quota.latest_refill_amount_credits)} credits`);
-    }
-    if (typeof quota.last_credit_at_ms === "number") refill.push(`at ${formatDate(quota.last_credit_at_ms)}`);
-    if (refill.length) {
-      const summary = document.createElement("p");
-      summary.dataset.muted = "";
-      summary.textContent = `${refill.join(" ")}. Estimates assume no further refill;${
-        typeof quota.cycle_started_at_ms === "number"
-          ? ` current cycle began ${formatDate(quota.cycle_started_at_ms)}.`
-          : ""
-      }`;
-      quotaRunwaySummary.appendChild(summary);
-    }
-  }
-  const bucketCount = balanceHistory.length;
-  const windowDays = typeof payload?.window_days === "number" ? payload.window_days : 30;
-  const windowLabel = `${windowDays}-day`;
-  const balanceWindowDays = typeof payload?.balance_window_days === "number" ? payload.balance_window_days : null;
-  const balanceBucketMs = payload?.retention?.balance_history_bucket_ms;
-  const balanceBucketLabel = balanceBucketMs === 24 * 60 * 60_000
-    ? "daily"
-    : balanceBucketMs === 60 * 60_000
-    ? "hourly"
-    : typeof balanceBucketMs === "number"
-    ? `${quotaProjectionDuration(balanceBucketMs)}-bucket`
-    : "";
-  const balanceWindowLabel = balanceWindowDays === null
-    ? "the returned window"
-    : `the trailing ${balanceWindowDays} days`;
-  const historyUnavailable = payload?.rollup_scan !== "ok";
-  const balanceUnavailable = payload?.balance_history_scan !== "ok";
-  if (historyUnavailable) {
-    quotaRunwayNote.textContent =
-      "Paid-fallback usage history could not be read — totals and exhaustion estimates are unavailable until KV reads recover.";
-  } else if (balanceUnavailable) {
-    quotaRunwayNote.textContent =
-      "Balance history could not be read — the run-down curve is unavailable until KV reads recover.";
-  } else if (bucketCount) {
-    quotaRunwayNote.textContent = `${formatNumber(bucketCount)} ${
-      balanceBucketLabel ? `${balanceBucketLabel} ` : ""
-    }balance samples in ${balanceWindowLabel} · estimates use the ${windowLabel} consumption window · raw request rows retain one year; hourly model rollups are retained indefinitely.`;
-  } else {
-    quotaRunwayNote.textContent =
-      `Estimates use the ${windowLabel} consumption window · raw request rows retain one year; hourly model rollups are retained indefinitely.`;
-  }
-  renderQuotaProjectionRows(payload, historyUnavailable);
-};
-
-const loadQuotaProjection = async () => {
-  if (quotaProjectionLoading) return false;
-  const token = getAdminToken();
-  if (!adminAccessState.isAdmin || !hasAdminCredential()) {
-    setBadge(quotaRunwayBadge, "bad", "Sign in required");
-    return false;
-  }
-  // Fence the render against token or API-base target changes while this
-  // request is in flight, so a switched session can never display another
-  // gateway's balance and usage.
-  const loadId = ++quotaProjectionLoadId;
-  const signature = `${token}\u0000${resolveBaseUrl()}`;
-  quotaProjectionLoading = true;
-  setBadge(quotaRunwayBadge, "unknown", quotaProjectionLoadedAt ? "Cached · refreshing" : "Loading projection");
-  try {
-    const response = await fetch(apiUrl("/admin/providers/quota-projection?window_days=30&balance_window_days=365"), {
-      cache: "no-store",
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const payload = await response.json().catch(() => null);
-    if (
-      loadId !== quotaProjectionLoadId ||
-      signature !== `${getAdminToken()}\u0000${resolveBaseUrl()}`
-    ) return false;
-    if (!response.ok || !payload) {
-      if (quotaProjectionLoadedAt) {
-        setBadge(quotaRunwayBadge, "unknown", "Cached · refresh unavailable");
-        quotaRunwayUpdated.textContent = "Cached · refresh unavailable";
-        return false;
-      }
-      setBadge(quotaRunwayBadge, "bad", payload?.error?.message ?? "Projection unavailable");
-      quotaRunwayUpdated.textContent = "Projection unavailable";
-      return false;
-    }
-    renderQuotaProjection(payload);
-    quotaProjectionLoadedAt = Date.now();
-    return true;
-  } catch {
-    if (loadId !== quotaProjectionLoadId) return false;
-    if (quotaProjectionLoadedAt) {
-      setBadge(quotaRunwayBadge, "unknown", "Cached · offline");
-      quotaRunwayUpdated.textContent = "Cached · offline";
-      return false;
-    }
-    setBadge(quotaRunwayBadge, "bad", "Offline");
-    quotaRunwayUpdated.textContent = "Projection unavailable";
-    return false;
-  } finally {
-    if (loadId === quotaProjectionLoadId) quotaProjectionLoading = false;
   }
 };
 
@@ -6895,6 +6552,7 @@ const VIEW_HASHES = {
   kernel: "kernel",
   pubkeys: "pubkeys",
   defaults: "defaults",
+  models: "models",
   analytics: "analytics",
   providers: "providers",
   errors: "errors",
@@ -7043,12 +6701,75 @@ const setErrorsMessage = (message) => {
   errorsList.appendChild(element);
 };
 
+const formatRetentionBytes = (bytes) => {
+  if (typeof bytes !== "number" || !Number.isFinite(bytes) || bytes < 0) return "unknown";
+  const gib = bytes / 1024 ** 3;
+  if (gib >= 1) return `${Math.round(gib * 100) / 100} GiB`;
+  const mib = bytes / 1024 ** 2;
+  if (mib >= 1) return `${Math.round(mib)} MiB`;
+  return `${formatNumber(Math.round(bytes / 1024))} KiB`;
+};
+
+/**
+ * Plain, persistent capture-retention status. Two scopes are labelled separately:
+ * the capture-owned KV payload budget, and host text logs which are only sized.
+ * The log scope renders independently, so a capture-accounting failure never
+ * hides a text-log warning.
+ */
+const retentionSkipReasonText = (reason) => {
+  if (reason === "storage_full") return "not enough space after removing the oldest recordings";
+  if (reason === "storage_accounting_in_progress") return "storage accounting is still catching up";
+  return "storage is temporarily unavailable";
+};
+
+const renderErrorsRetention = (payload) => {
+  const parts = [];
+  const retention = payload?.retention;
+  if (
+    retention?.state === "ok" &&
+    retention.accounting_complete === true && !retention.accounting_error &&
+    [retention.stored_bytes, retention.reserved_bytes, retention.budget_bytes, retention.records].every((value) =>
+      typeof value === "number" && Number.isFinite(value) && value >= 0
+    ) && Number.isFinite(retention.stored_bytes + retention.reserved_bytes)
+  ) {
+    const used = retention.stored_bytes + retention.reserved_bytes;
+    parts.push(
+      `Capture storage ${formatRetentionBytes(used)} of ${formatRetentionBytes(retention.budget_bytes)} · ${
+        formatNumber(retention.records)
+      } recordings`,
+    );
+    if (typeof retention.evicted_records === "number" && retention.evicted_records > 0) {
+      parts.push("Oldest recordings were removed to keep new ones within the 1 GiB limit");
+    } else if (retention.near_capacity) {
+      parts.push("Approaching the storage limit");
+    }
+    if (typeof retention.skipped_reason === "string" && retention.skipped_reason) {
+      parts.push(`Newest recording skipped: ${retentionSkipReasonText(retention.skipped_reason)}`);
+    }
+  } else {
+    parts.push("Capture storage usage unavailable");
+  }
+  const logs = payload?.log_files;
+  if (logs) {
+    if (typeof logs.total_bytes === "number") {
+      parts.push(`Gateway text logs ${formatRetentionBytes(logs.total_bytes)}`);
+    } else if (Array.isArray(logs.files) && logs.files.length === 0) {
+      parts.push("Gateway text-log sizing not applicable on this host (journald logs are separate)");
+    } else {
+      parts.push("Gateway text log sizes unavailable");
+    }
+    if (logs.warning) parts.push("Text logs reached 1 GiB; rotation is separate");
+  }
+  errorsRetention.textContent = `${parts.join(" · ")}.`;
+};
+
 const invalidateAdminErrors = (message) => {
   errorsLoadId += 1;
   errorsLoading = false;
   errorsLoadedAt = 0;
   setBadge(errorsBadge, "unknown", "Not loaded");
   errorsUpdated.textContent = "";
+  errorsRetention.textContent = "Capture storage status unavailable.";
   setErrorsMessage(message);
 };
 
@@ -7106,6 +6827,7 @@ const loadAdminErrors = async () => {
     if (!res.ok) throw new Error(data?.error?.message || "Error history is unavailable");
     const records = Array.isArray(data?.data) ? data.data : [];
     renderAdminErrors(records);
+    renderErrorsRetention(data);
     errorsLoadedAt = Date.now();
     setBadge(errorsBadge, records.length ? "bad" : "ok", `${records.length} errors`);
     errorsUpdated.textContent = `Updated ${formatDate(errorsLoadedAt)}`;
@@ -7297,15 +7019,8 @@ const loadAdminView = (view) => {
         if (!loaded) providerCapacityLoadedForOpen = false;
       });
     }
-    if (!quotaProjectionLoadedForOpen) {
-      quotaProjectionLoadedForOpen = true;
-      void loadQuotaProjection().then((loaded) => {
-        if (!loaded) quotaProjectionLoadedForOpen = false;
-      });
-    }
   } else {
     providerCapacityLoadedForOpen = false;
-    quotaProjectionLoadedForOpen = false;
   }
   if (view === "providers") {
     // The picker shows provider health beside each row, so the analytics
@@ -8046,14 +7761,14 @@ const loadDefaults = async (options = {}) => {
 // The public Models page renders providers, reasoning tiers, and context sizes
 // for each catalog entry; this panel reuses that presentation with a checkbox
 // per model so an operator can switch visibility on and off.
-const MODEL_PROVIDER_LABELS = {
-  codex: "Codex",
-  openlux: "Metered 2",
-  surplus: "Metered 1",
-  deepseek: "DeepSeek",
-  cerebras: "Cerebras",
-};
-const MODEL_PROVIDER_IDS = ["codex", "openlux", "surplus", "deepseek", "cerebras"];
+//
+// Provider presentation — label, tier, detail, endpoints, and health key — is
+// returned by `/admin/providers/selection` and kept in one dictionary both tabs
+// render from, so a provider this panel has never heard of needs no edit here.
+let providerRoster = [];
+let providerTiers = [];
+const providerLabelFor = (id) => providerRosterEntry(id)?.label ?? id;
+const providerTierLabelFor = (tier) => providerTiers.find((entry) => entry.id === tier)?.label ?? tier;
 const MODEL_REASONING_ORDER = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const MODEL_TOKEN_FORMAT = new Intl.NumberFormat("en-US");
 const MODEL_DATE_FORMAT = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "2-digit" });
@@ -8141,9 +7856,7 @@ const modelsEntryMatchesQuery = (entry, query) => {
     contextWindow ? "context compact compression" : "",
   ].filter(Boolean).join(" ").toLowerCase();
   return String(entry.id ?? "").toLowerCase().includes(query) ||
-    (entry.providers ?? []).some((provider) =>
-      (MODEL_PROVIDER_LABELS[provider.id] ?? provider.id).toLowerCase().includes(query)
-    ) ||
+    (entry.providers ?? []).some((provider) => providerLabelFor(provider.id).toLowerCase().includes(query)) ||
     reasoning?.levels?.some((level) => level.includes(query)) ||
     contextSearch.includes(query);
 };
@@ -8172,13 +7885,47 @@ const modelsVisibleEntries = () => {
 };
 
 const modelsProviderCounts = () => {
-  const counts = new Map([["all", modelsCatalog.length], ...MODEL_PROVIDER_IDS.map((id) => [id, 0])]);
+  const counts = new Map([["all", modelsCatalog.length], ...providerRoster.map((entry) => [entry.id, 0])]);
   for (const entry of modelsCatalog) {
     for (const provider of entry.providers ?? []) {
       if (counts.has(provider.id)) counts.set(provider.id, counts.get(provider.id) + 1);
     }
   }
   return counts;
+};
+
+const buildModelProviderFilterChip = (id, label) => {
+  const button = document.createElement("button");
+  button.id = `models-whitelist-provider-${id}`;
+  button.type = "button";
+  button.dataset.modelProvider = id;
+  button.setAttribute("aria-pressed", id === modelsProviderFilter ? "true" : "false");
+  const count = document.createElement("span");
+  count.dataset.modelFilterCount = "";
+  count.textContent = "0";
+  button.append(label, " ", count);
+  return button;
+};
+
+const updateModelProviderFilterChips = () => {
+  const counts = modelsProviderCounts();
+  for (const button of modelsProviderFilters.querySelectorAll("[data-model-provider]")) {
+    const id = button.dataset.modelProvider;
+    const count = counts.get(id) ?? 0;
+    button.setAttribute("aria-pressed", id === modelsProviderFilter ? "true" : "false");
+    button.disabled = id !== "all" && count === 0;
+    const countElement = button.querySelector("[data-model-filter-count]");
+    if (countElement) countElement.textContent = formatNumber(count);
+    button.title = modelsCatalogSources?.[id]?.configured === false ? `${providerLabelFor(id)} is not configured` : "";
+  }
+};
+
+/** One chip per roster provider, so a provider the panel has never heard of still gets a filter. */
+const renderModelProviderFilters = () => {
+  const chips = [buildModelProviderFilterChip("all", "All")];
+  for (const entry of providerRoster) chips.push(buildModelProviderFilterChip(entry.id, providerLabelFor(entry.id)));
+  modelsProviderFilters.replaceChildren(...chips);
+  updateModelProviderFilterChips();
 };
 
 const buildModelOption = (entry) => {
@@ -8206,7 +7953,7 @@ const buildModelOption = (entry) => {
   for (const provider of entry.providers ?? []) {
     const badge = document.createElement("span");
     badge.dataset.modelProviderBadge = "";
-    badge.textContent = MODEL_PROVIDER_LABELS[provider.id] ?? provider.id;
+    badge.textContent = providerLabelFor(provider.id);
     badge.title = (provider.supported_endpoints ?? []).join(", ");
     providers.append(badge);
   }
@@ -8254,7 +8001,8 @@ const invalidateAdminModels = (message) => {
 };
 
 const modelsCatalogWarning = () => {
-  const unavailable = MODEL_PROVIDER_IDS
+  const unavailable = providerRoster
+    .map((entry) => entry.id)
     .filter((id) => {
       const source = modelsCatalogSources?.[id];
       if (!source?.status || source.status === "available") return false;
@@ -8262,7 +8010,7 @@ const modelsCatalogWarning = () => {
       // on purpose; only a configured source that failed to read is a warning.
       return source.configured !== false;
     })
-    .map((id) => MODEL_PROVIDER_LABELS[id]);
+    .map((id) => providerLabelFor(id));
   if (!unavailable.length) return "";
   return `${
     unavailable.join(", ")
@@ -8367,18 +8115,7 @@ const updateModelsStatus = () => {
     setModelsWhitelistBadge("ok", selected === 0 ? "No filter" : `${formatNumber(selected)} checked`);
   } else setModelsWhitelistBadge("unknown", "Not loaded");
 
-  const counts = modelsProviderCounts();
-  for (const button of modelsProviderButtons) {
-    const id = button.dataset.modelProvider;
-    const count = counts.get(id) ?? 0;
-    button.setAttribute("aria-pressed", id === modelsProviderFilter ? "true" : "false");
-    button.disabled = id !== "all" && count === 0;
-    const countElement = button.querySelector("[data-model-filter-count]");
-    if (countElement) countElement.textContent = formatNumber(count);
-    button.title = modelsCatalogSources?.[id]?.configured === false
-      ? `${MODEL_PROVIDER_LABELS[id]} is not configured`
-      : "";
-  }
+  updateModelProviderFilterChips();
 
   modelsCheckAllBtn.disabled = saving || visibleCount === 0 || visibleChecked === visibleCount;
   modelsUncheckAllBtn.disabled = saving || visibleChecked === 0;
@@ -8447,6 +8184,10 @@ const loadModelsWhitelist = async (options = {}) => {
   }
   const loadId = ++modelsLoadId;
   setModelsWhitelistBadge("unknown", modelsLoadedAt ? "Cached · refreshing" : "Loading...");
+  // The provider chips and labels come from the roster, so this tab asks for it
+  // when the Providers prefetch has not already loaded the shared dictionary.
+  if (!providerRoster.length) void loadProviderSelection();
+  renderModelProviderFilters();
   try {
     const response = await fetch(apiUrl("/admin/models/catalog"), {
       headers: { Authorization: `Bearer ${token}` },
@@ -8548,17 +8289,22 @@ const readModelsFilterPreference = (key, fallback, allowed) => {
   return allowed.includes(stored) ? stored : fallback;
 };
 
-modelsProviderFilter = readModelsFilterPreference(MODEL_PROVIDER_STORAGE_KEY, "all", ["all", ...MODEL_PROVIDER_IDS]);
+const storedModelsProviderFilter = storage.get(MODEL_PROVIDER_STORAGE_KEY);
+modelsProviderFilter = typeof storedModelsProviderFilter === "string" && storedModelsProviderFilter
+  ? storedModelsProviderFilter
+  : "all";
 modelsSortSelect.value = readModelsFilterPreference(MODEL_SORT_STORAGE_KEY, "id", ["id", "created"]);
 modelsOnlySelectedInput.checked = storage.get(MODEL_ONLY_SELECTED_STORAGE_KEY) === "1";
 
-for (const button of modelsProviderButtons) {
-  button.addEventListener("click", () => {
-    modelsProviderFilter = button.dataset.modelProvider ?? "all";
-    storage.set(MODEL_PROVIDER_STORAGE_KEY, modelsProviderFilter);
-    renderModelsPicker();
-  });
-}
+// The chips are rendered from the loaded roster, so the click is delegated to
+// the container: a chip added by a later load works without re-binding.
+modelsProviderFilters.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-model-provider]");
+  if (!button) return;
+  modelsProviderFilter = button.dataset.modelProvider ?? "all";
+  storage.set(MODEL_PROVIDER_STORAGE_KEY, modelsProviderFilter);
+  renderModelsPicker();
+});
 
 modelsSearchInput.addEventListener("input", renderModelsPicker);
 modelsSortSelect.addEventListener("change", () => {
@@ -8628,62 +8374,13 @@ modelsWhitelistSave.addEventListener("click", () => {
 // ── Provider selection picker ────────────────────────────────────────────────
 // The model picker chooses which models stay listed; this panel chooses which
 // upstream providers the gateway may dispatch to at all. The waterfall order is
-// fixed, so the ladder below is presentation only: checking a provider never
+// fixed, so the rendered ladder is presentation only: checking a provider never
 // promotes it, and unchecking one removes its tier.
-const PROVIDER_ROSTER = [
-  {
-    id: "codex",
-    label: "Codex",
-    tier: "subscription",
-    detail: "ChatGPT subscription capacity. The waterfall always tries it first.",
-    endpoints: "/v1/responses · /v1/chat/completions",
-  },
-  {
-    id: "surplus",
-    label: "Metered 1",
-    tier: "paid",
-    detail: "Surplus Intelligence. Second tier of the paid waterfall.",
-    endpoints: "/v1/responses · /v1/chat/completions",
-  },
-  {
-    id: "openlux",
-    label: "Metered 2",
-    tier: "paid",
-    detail: "OpenLux. Last tier of the paid waterfall.",
-    endpoints: "/v1/responses · /v1/chat/completions",
-  },
-  {
-    id: "deepseek",
-    label: "DeepSeek",
-    tier: "direct",
-    detail: "Official DeepSeek key, served on Chat Completions only.",
-    endpoints: "/v1/chat/completions",
-  },
-  {
-    id: "cerebras",
-    label: "Cerebras",
-    tier: "direct",
-    detail: "GPT-OSS 120B, served on Chat Completions only.",
-    endpoints: "/v1/chat/completions",
-  },
-];
-const PROVIDER_TIER_LABELS = { subscription: "Subscription", paid: "Paid fallback", direct: "Direct" };
-const PROVIDER_TIER_IDS = ["subscription", "paid", "direct"];
-/** The health snapshot reports the OpenLux tier under its upstream name. */
-const PROVIDER_HEALTH_KEYS = {
-  codex: "codex",
-  surplus: "surplus",
-  openlux: "metered",
-  deepseek: "deepseek",
-  cerebras: "cerebras",
-};
 const PROVIDER_SORT_STORAGE_KEY = "uos_ai.admin.providers_sort";
 const PROVIDER_TIER_STORAGE_KEY = "uos_ai.admin.providers_tier";
 const PROVIDER_ONLY_ACTIVE_STORAGE_KEY = "uos_ai.admin.providers_only_active";
-const PROVIDER_ALL_IDS = PROVIDER_ROSTER.map((provider) => provider.id);
 
-/** The roster the API last returned, the staged selection, and the saved one. */
-let providerRoster = [];
+/** The staged selection and the saved one; the roster itself comes from the API. */
 let providerSelection = new Set();
 let providersSavedSelection = new Set();
 let providerTierFilter = "all";
@@ -8698,7 +8395,40 @@ const setProvidersSelectionBadge = (state, text) => setBadge(providersSelectionB
 const providerRosterEntry = (id) => providerRoster.find((entry) => entry.id === id) ?? null;
 
 /** The loaded roster, so a retired provider never reaches the API again. */
-const providersRosterIds = () => (providerRoster.length ? providerRoster.map((entry) => entry.id) : PROVIDER_ALL_IDS);
+const providersRosterIds = () => providerRoster.map((entry) => entry.id);
+
+/** One tier chip per tier the payload lists, plus the unfiltered "all" chip. */
+const buildProviderTierFilterChip = (id, label) => {
+  const button = document.createElement("button");
+  button.id = `providers-selection-tier-${id}`;
+  button.type = "button";
+  button.dataset.providerTier = id;
+  button.setAttribute("aria-pressed", id === providerTierFilter ? "true" : "false");
+  const count = document.createElement("span");
+  count.dataset.providerFilterCount = "";
+  count.textContent = "0";
+  button.append(label, " ", count);
+  return button;
+};
+
+const updateProviderTierFilterChips = () => {
+  const counts = providersTierCounts();
+  for (const button of providersTierFilters.querySelectorAll("[data-provider-tier]")) {
+    const tier = button.dataset.providerTier;
+    const count = counts.get(tier) ?? 0;
+    button.setAttribute("aria-pressed", tier === providerTierFilter ? "true" : "false");
+    button.disabled = tier !== "all" && count === 0;
+    const countElement = button.querySelector("[data-provider-filter-count]");
+    if (countElement) countElement.textContent = formatNumber(count);
+  }
+};
+
+const renderProviderTierFilters = () => {
+  const chips = [buildProviderTierFilterChip("all", "All")];
+  for (const tier of providerTiers) chips.push(buildProviderTierFilterChip(tier.id, providerTierLabelFor(tier.id)));
+  providersTierFilters.replaceChildren(...chips);
+  updateProviderTierFilterChips();
+};
 
 /** One configured Codex subscription, as the API reports it. */
 const providersSubscriptionsFor = (entry) =>
@@ -8768,7 +8498,7 @@ const providersSelectedIds = () => {
 };
 
 const providersTierCounts = () => {
-  const counts = new Map([["all", providerRoster.length], ...PROVIDER_TIER_IDS.map((tier) => [tier, 0])]);
+  const counts = new Map([["all", providerRoster.length], ...providerTiers.map((tier) => [tier.id, 0])]);
   for (const entry of providerRoster) counts.set(entry.tier, (counts.get(entry.tier) ?? 0) + 1);
   return counts;
 };
@@ -8777,7 +8507,7 @@ const providersEntryMatchesQuery = (entry, query) => {
   if (!query) return true;
   return entry.id.toLowerCase().includes(query) ||
     entry.label.toLowerCase().includes(query) ||
-    (PROVIDER_TIER_LABELS[entry.tier] ?? entry.tier).toLowerCase().includes(query) ||
+    providerTierLabelFor(entry.tier).toLowerCase().includes(query) ||
     String(entry.model_count ?? 0).includes(query) ||
     entry.detail.toLowerCase().includes(query) ||
     providersSubscriptionsFor(entry).some((subscription) =>
@@ -8807,18 +8537,24 @@ const providersVisibleEntries = () => {
   if (providersSortSelect.value === "id") {
     return visible.sort((left, right) => left.label.localeCompare(right.label) || left.id.localeCompare(right.id));
   }
-  return visible.sort((left, right) => PROVIDER_ALL_IDS.indexOf(left.id) - PROVIDER_ALL_IDS.indexOf(right.id));
+  const rosterIds = providersRosterIds();
+  return visible.sort((left, right) => rosterIds.indexOf(left.id) - rosterIds.indexOf(right.id));
 };
 
-const providerHealthFor = (id) => {
-  const key = PROVIDER_HEALTH_KEYS[id];
-  const entry = latestProviderHealth?.[key];
-  if (!entry || typeof entry !== "object") return null;
-  const state = typeof entry.state === "string" ? entry.state : entry.health?.state;
+/**
+ * Provider health for one roster row, read through the row's own `health_key`
+ * so the panel keeps no mapping of its own. The snapshot reports the OpenLux
+ * tier under its upstream name, and the row says so.
+ */
+const providerHealthFor = (entry) => {
+  const key = entry?.health_key;
+  const health = typeof key === "string" && key ? latestProviderHealth?.[key] : null;
+  if (!health || typeof health !== "object") return null;
+  const state = typeof health.state === "string" ? health.state : health.health?.state;
   return {
     state: typeof state === "string" ? state : null,
-    configured: entry.configured !== false,
-    accountCount: typeof entry.account_count === "number" ? entry.account_count : null,
+    configured: health.configured !== false,
+    accountCount: typeof health.account_count === "number" ? health.account_count : null,
   };
 };
 
@@ -8851,9 +8587,9 @@ const buildProviderOption = (entry) => {
   badges.dataset.providerBadges = "";
   const tier = document.createElement("span");
   tier.dataset.providerTierBadge = entry.tier;
-  tier.textContent = PROVIDER_TIER_LABELS[entry.tier] ?? entry.tier;
+  tier.textContent = entry.tier_label ?? providerTierLabelFor(entry.tier);
   badges.append(tier);
-  const health = providerHealthFor(id);
+  const health = providerHealthFor(entry);
   if (health) {
     const healthBadge = document.createElement("span");
     healthBadge.dataset.providerHealthBadge = health.state ?? "unknown";
@@ -8867,7 +8603,7 @@ const buildProviderOption = (entry) => {
   detail.textContent = entry.detail;
   body.append(detail);
 
-  const facts = [`${formatNumber(Number(entry.model_count ?? 0))} catalog models`, entry.endpoints];
+  const facts = [`${formatNumber(Number(entry.model_count ?? 0))} catalog models`, (entry.endpoints ?? []).join(" · ")];
   if (entry.status && entry.status !== "available") facts.push("Catalog unavailable");
   if (codex?.total) {
     facts.push(
@@ -8948,6 +8684,7 @@ const invalidateProviderSelection = (message) => {
   providerSelectionLoadId += 1;
   providerSelectionSaving = false;
   providerRoster = [];
+  providerTiers = [];
   providerSelection = new Set();
   providersSavedSelection = new Set();
   providersVisibleIds = new Set();
@@ -8955,6 +8692,8 @@ const invalidateProviderSelection = (message) => {
   providerSelectionSaveError = "";
   setProvidersSelectionBadge("unknown", "Not loaded");
   renderProvidersMessage(message);
+  renderModelProviderFilters();
+  renderProviderTierFilters();
   updateProvidersStatus();
 };
 
@@ -8994,12 +8733,11 @@ const providersRoutingWarnings = () => {
 };
 
 const providersHealthWarning = () => {
-  const missing = PROVIDER_ALL_IDS.filter((id) => {
-    const health = providerHealthFor(id);
-    return isProviderChecked(id) && health?.configured === false;
-  });
+  const missing = providerRoster.filter((entry) =>
+    isProviderChecked(entry.id) && providerHealthFor(entry)?.configured === false
+  );
   if (!missing.length) return "";
-  const labels = missing.map((id) => providerRosterEntry(id)?.label ?? id);
+  const labels = missing.map((entry) => entry.label ?? entry.id);
   return `${labels.join(", ")} ${
     labels.length === 1 ? "is" : "are"
   } active without a configured credential, so requests to ${
@@ -9051,15 +8789,7 @@ const updateProvidersStatus = () => {
     setProvidersSelectionBadge("ok", filterActive ? `${formatNumber(activeTiers)} active` : "No filter");
   } else setProvidersSelectionBadge("unknown", "Not loaded");
 
-  const counts = providersTierCounts();
-  for (const button of providersTierButtons) {
-    const tier = button.dataset.providerTier;
-    const count = counts.get(tier) ?? 0;
-    button.setAttribute("aria-pressed", tier === providerTierFilter ? "true" : "false");
-    button.disabled = tier !== "all" && count === 0;
-    const countElement = button.querySelector("[data-provider-filter-count]");
-    if (countElement) countElement.textContent = formatNumber(count);
-  }
+  updateProviderTierFilterChips();
 
   providersCheckAllBtn.disabled = saving || visibleCount === 0 || visibleChecked === visibleCount;
   providersUncheckAllBtn.disabled = saving || visibleChecked === 0;
@@ -9164,14 +8894,26 @@ const loadProviderSelection = async (options = {}) => {
       renderProvidersMessage(payload?.error?.message ?? "The provider roster could not be loaded.");
       return false;
     }
-    providerRoster = payload.data.providers
-      .filter((entry) => typeof entry?.id === "string" && entry.id)
-      .map((entry) => ({ ...(PROVIDER_ROSTER.find((known) => known.id === entry.id) ?? {}), ...entry }))
-      .filter((entry) => typeof entry.detail === "string");
+    providerRoster = payload.data.providers.filter((entry) => typeof entry?.id === "string" && entry.id);
+    providerTiers = Array.isArray(payload.data.tiers)
+      ? payload.data.tiers.filter((tier) => typeof tier?.id === "string" && tier.id)
+      : [];
+    // A filter the roster no longer lists would hide every row with no chip lit
+    // to explain it, so it falls back to the unfiltered state.
+    if (modelsProviderFilter !== "all" && !providerRosterEntry(modelsProviderFilter)) {
+      modelsProviderFilter = "all";
+      storage.set(MODEL_PROVIDER_STORAGE_KEY, "all");
+    }
+    if (providerTierFilter !== "all" && !providerTiers.some((tier) => tier.id === providerTierFilter)) {
+      providerTierFilter = "all";
+      storage.set(PROVIDER_TIER_STORAGE_KEY, "all");
+    }
     providersSavedSelection = providersSelectionFromIds(payload.data.selection?.provider_ids);
     providerSelection = new Set(providersSavedSelection);
     providerSelectionSaveError = "";
     providerSelectionLoadedAt = Date.now();
+    renderModelProviderFilters();
+    renderProviderTierFilters();
     renderProvidersPicker();
     return true;
   } catch (error) {
@@ -9249,17 +8991,22 @@ const reloadProviderSelection = () => {
   void loadProviderSelection({ force: true });
 };
 
-providerTierFilter = readModelsFilterPreference(PROVIDER_TIER_STORAGE_KEY, "all", ["all", ...PROVIDER_TIER_IDS]);
+const storedProviderTierFilter = storage.get(PROVIDER_TIER_STORAGE_KEY);
+providerTierFilter = typeof storedProviderTierFilter === "string" && storedProviderTierFilter
+  ? storedProviderTierFilter
+  : "all";
 providersSortSelect.value = readModelsFilterPreference(PROVIDER_SORT_STORAGE_KEY, "roster", ["roster", "models", "id"]);
 providersOnlyActiveInput.checked = storage.get(PROVIDER_ONLY_ACTIVE_STORAGE_KEY) === "1";
 
-for (const button of providersTierButtons) {
-  button.addEventListener("click", () => {
-    providerTierFilter = button.dataset.providerTier ?? "all";
-    storage.set(PROVIDER_TIER_STORAGE_KEY, providerTierFilter);
-    renderProvidersPicker();
-  });
-}
+// Tier chips are rendered from the payload, so the click is delegated to the
+// container and a chip from a later load needs no re-binding.
+providersTierFilters.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-provider-tier]");
+  if (!button) return;
+  providerTierFilter = button.dataset.providerTier ?? "all";
+  storage.set(PROVIDER_TIER_STORAGE_KEY, providerTierFilter);
+  renderProvidersPicker();
+});
 
 providersSearchInput.addEventListener("input", renderProvidersPicker);
 providersSortSelect.addEventListener("change", () => {
@@ -9451,7 +9198,6 @@ const hydrateAdminSnapshots = async () => {
     "/admin/providers",
     "/admin/providers/capacity",
     "/admin/errors?limit=1",
-    "/admin/providers/quota-projection?window_days=30&balance_window_days=365",
     "/admin/errors?limit=200",
   ];
   const snapshots = await Promise.all(paths.map((path) => readAdminSnapshot(path)));
@@ -9472,7 +9218,6 @@ const hydrateAdminSnapshots = async () => {
     providersSnapshot,
     capacitySnapshot,
     capacityErrorsSnapshot,
-    quotaProjectionSnapshot,
     errorsSnapshot,
   ] = snapshots;
 
@@ -9596,14 +9341,6 @@ const hydrateAdminSnapshots = async () => {
     renderProviderCapacityList(latestProviderCapacityChartState.sources);
   }
 
-  const quotaProjectionPayload = cachedPayload(quotaProjectionSnapshot);
-  if (quotaProjectionPayload && quotaProjectionLoadedAt <= quotaProjectionSnapshot.savedAt) {
-    renderQuotaProjection(quotaProjectionPayload);
-    quotaProjectionLoadedAt = quotaProjectionSnapshot.savedAt;
-    quotaRunwayUpdated.textContent = `Cached ${formatDate(quotaProjectionSnapshot.savedAt)} · refreshing`;
-    setBadge(quotaRunwayBadge, "unknown", "Cached · refreshing");
-  }
-
   const errors = cachedList(errorsSnapshot);
   if (errors && errorsLoadedAt <= errorsSnapshot.savedAt) {
     renderAdminErrors(errors);
@@ -9657,9 +9394,22 @@ setAuthBadge("unknown", "Checking...");
 setAdminAccessState({ checked: false, isAdmin: false, isSuperAdmin: false });
 scheduleTokenCheck();
 
+const refreshAnalyticsView = () => {
+  // Every loader returns early while its own request is in flight, so the
+  // visible poll and a resume refresh can never stack duplicate requests.
+  void loadProviders();
+  void loadProviderCapacity();
+};
+
 bindForegroundRefresh(() => {
-  if (currentAdminView !== "defaults" || !adminAccessState.isAdmin || !hasAdminCredential()) return;
-  void loadDefaults({ preserveInputs: true });
+  if (!adminAccessState.isAdmin || !hasAdminCredential()) return;
+  if (currentAdminView === "analytics") {
+    // Resume refreshes the quota panels immediately instead of waiting for
+    // the next visible poll tick or a full reload.
+    refreshAnalyticsView();
+  } else if (currentAdminView === "defaults") {
+    void loadDefaults({ preserveInputs: true });
+  }
 });
 
 authWidgetToggle.addEventListener("click", () => {
@@ -9701,16 +9451,6 @@ tokenInput.addEventListener("input", () => {
   providersLoadedAt = 0;
   providerCapacityLoadedForOpen = false;
   providerCapacityLoadedAt = 0;
-  quotaProjectionLoadedForOpen = false;
-  quotaProjectionLoading = false;
-  quotaProjectionLoadedAt = 0;
-  quotaProjectionLoadId += 1;
-  quotaRunwayBadge.setAttribute("data-state", "unknown");
-  quotaRunwayBadge.textContent = "Not loaded";
-  quotaRunwayUpdated.textContent = "Waiting for projection";
-  quotaRunwaySummary.replaceChildren();
-  quotaRunwayList.replaceChildren();
-  quotaRunwayNote.textContent = "";
   latestProviderCapacityChartState = null;
   latestProviderHealth = null;
   providerCapacityChart.replaceChildren();
@@ -9914,16 +9654,6 @@ baseSelect.addEventListener("change", () => {
   providersLoadedAt = 0;
   providerCapacityLoadedForOpen = false;
   providerCapacityLoadedAt = 0;
-  quotaProjectionLoadedForOpen = false;
-  quotaProjectionLoading = false;
-  quotaProjectionLoadedAt = 0;
-  quotaProjectionLoadId += 1;
-  quotaRunwayBadge.setAttribute("data-state", "unknown");
-  quotaRunwayBadge.textContent = "Not loaded";
-  quotaRunwayUpdated.textContent = "Waiting for projection";
-  quotaRunwaySummary.replaceChildren();
-  quotaRunwayList.replaceChildren();
-  quotaRunwayNote.textContent = "";
   latestProviderCapacityChartState = null;
   latestProviderHealth = null;
   providerCapacityChart.replaceChildren();
@@ -9984,9 +9714,7 @@ bindTablistKeyboard(keysTabActive.closest('[role="tablist"]'));
 
 globalThis.setInterval(() => {
   if (currentAdminView !== "analytics" || document.visibilityState !== "visible") return;
-  void loadProviders();
-  void loadProviderCapacity();
-  void loadQuotaProjection();
+  refreshAnalyticsView();
 }, 30_000);
 
 createKeyBtn.addEventListener("click", () => {
