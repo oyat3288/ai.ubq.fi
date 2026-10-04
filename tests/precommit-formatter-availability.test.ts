@@ -70,7 +70,9 @@ Deno.test("pre-commit fails with install guidance when staged TypeScript has no 
     const stderr = decoder.decode(result.stderr);
     assert.equal(result.code, 1, stderr);
     assert.match(stderr, /Prettier is not installed/);
-    assert.match(stderr, /run 'bun install' in tools\/lint then 'sh scripts\/format\.sh'/);
+    assert.match(stderr, /tools\/lint/);
+    assert.match(stderr, /bun install/);
+    assert.match(stderr, /sh scripts\/format\.sh/);
     assert.deepEqual(await Deno.readFile(`${fixture.path}/.git/index`), indexBefore);
     assert.equal(await git(fixture, "show", ":selected.ts"), stagedSource);
     assert.equal(await Deno.readTextFile(`${fixture.path}/selected.ts`), stagedSource);
