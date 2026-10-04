@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import handler from "../src/handler.ts";
+import handler from "../src/handler/index.ts";
 import { corsHeaders } from "../src/http.ts";
 import { handleRoot, handleStaticAsset, hasStaticAsset } from "../src/static.ts";
 import readmeText from "../README.md" with { type: "text" };
@@ -315,6 +315,8 @@ Deno.test("admin console tabs follow the approved operator order", () => {
 Deno.test("models page labels provider counts as catalog entries, not inference availability", () => {
   assert.match(modelsHtml, /Model catalog/);
   assert.match(modelsHtml, /Availability and quota vary by provider/);
+  assert.match(modelsHtml, /Cataloged text models and the providers that list them/);
+  assert.match(modelsHtml, /does not guarantee\s+inference availability or remaining quota/);
   assert.doesNotMatch(modelsHtml, /Live upstream catalog/);
   assert.match(modelsScript, /cataloged model/);
   assert.match(modelsScript, /cataloged models/);
@@ -372,7 +374,7 @@ Deno.test("admin analytics view places capacity history before current providers
   assert.match(adminHtml, /id="view-tab-analytics"[\s\S]*?>\s*Analytics\s*</);
   assert.doesNotMatch(adminHtml, /Fifteen-minute capacity, cached-input, and cache-write history/);
   assert.match(adminHtml, /admin\.css\?v=passport-design-20260922/);
-  assert.match(adminHtml, /admin\.js\?v=passport-design-20260922/);
+  assert.match(adminHtml, /admin\.js\?v=analytics-trim-20261003/);
   assert.doesNotMatch(adminHtml, /removed_provider-failover|debug-routing/);
   assert.doesNotMatch(adminScript, /RemovedProviderFailover|refresh=live/);
   assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/capacity"\)/);
@@ -813,8 +815,10 @@ Deno.test("admin paid-provider wallet display never claims a balance the token e
   assert.doesNotMatch(adminHtml, /Available tokens|Granted tokens|Used tokens/);
   assert.doesNotMatch(adminScript, /meteredQuotaGranted|meteredQuotaTokenUsage/);
   assert.match(adminHtml, /<dt>Balance<\/dt>/);
-  assert.match(adminScript, /"Not reported by provider"/);
-  assert.match(adminScript, /"Balance not reported — no exhaustion estimate"/);
+  // The Analytics Metered capacity row and quota forecast card that carried the
+  // removed "Not reported" labels are gone (2026-10-03 trim); the surviving
+  // Defaults metered-quota panel must still refuse to report an unprovable balance.
+  assert.match(adminScript, /meteredQuotaBalance\.textContent = "Not reported"/);
   // The real, event-derived provider signal and its timestamp survive.
   assert.match(adminScript, /appendProviderFact\(facts, "Inference", status\.health \? providerStateLabel\(status\.health\) : "Not observed"\)/);
   assert.match(adminScript, /appendProviderFact\(facts, "Last response", formatDate\(status\.health\?\.last_observed_at_ms\)\)/);

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 
 import { setKvForTest } from "../src/kv.ts";
-import { codexResetRedemptionKey, codexResetShadowDecisionKey } from "../src/codex_banked_reset.ts";
-import { CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY, resetCodexAccountRoutingForTest } from "../src/codex_account_routing.ts";
-import { CODEX_AUTH_POOL_KV_KEY, resetCodexAuthCacheForTest } from "../src/codex.ts";
+import { codexResetRedemptionKey, codexResetShadowDecisionKey } from "../src/codex/banked-reset.ts";
+import { CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY, resetCodexAccountRoutingForTest } from "../src/codex/account-routing.ts";
+import { CODEX_AUTH_POOL_KV_KEY, resetCodexAuthCacheForTest } from "../src/codex/index.ts";
 import {
   getPersistedProviderCapacityView,
   handleProviderCapacity,
@@ -12,23 +12,25 @@ import {
   PROVIDER_CAPACITY_HISTORY_RETENTION_MS,
   PROVIDER_CAPACITY_LEASE_KEY,
   PROVIDER_CAPACITY_RATE_LIMIT_RESET_MIN_GAIN_PERCENTAGE_POINTS,
+  PROVIDER_CAPACITY_READ_FRESH_MS,
   PROVIDER_CAPACITY_SNAPSHOT_KEY,
   PROVIDER_CAPACITY_SOURCE_STALE_MS,
   type ProviderCapacityCodexSource,
+  type ProviderCapacitySource,
   providerCapacityHistoryKey,
   refreshProviderCapacity,
   sampleProviderCapacityOnEvent,
-} from "../src/provider_capacity.ts";
-import { PROMPT_CACHE_ANALYTICS_BUCKET_MS, promptCacheAnalyticsCounterKey } from "../src/prompt_cache_analytics.ts";
+} from "../src/provider/capacity.ts";
+import { PROMPT_CACHE_ANALYTICS_BUCKET_MS, promptCacheAnalyticsCounterKey } from "../src/cache/prompt-analytics.ts";
 import {
   listProviderCapacityDowntimeEvents,
   PROVIDER_CAPACITY_DOWNTIME_EVENT_KV_PREFIX,
   PROVIDER_CAPACITY_RATE_LIMIT_RESET_EVENT_KV_PREFIX,
   PROVIDER_CAPACITY_RESET_EVENT_KV_PREFIX,
   recordProviderCapacityDowntimeEvent,
-} from "../src/provider_capacity_events.ts";
-import { METERED_QUOTA_STATE_KEY } from "../src/metered_quota.ts";
-import { CountingKv } from "./helpers/counting_kv.ts";
+} from "../src/provider/capacity-events.ts";
+import { METERED_QUOTA_STATE_KEY } from "../src/metered-quota.ts";
+import { CountingKv } from "./helpers/counting-kv.ts";
 
 type StoredValue = {
   value: unknown;
@@ -72,11 +74,11 @@ const kvStore = new CapacityKvStore();
 const kvStub = {
   get: (key: Deno.KvKey) => {
     const stored = kvStore.get(keyToString(key));
-    return {
+    return Promise.resolve({
       key,
       value: stored?.value ?? null,
       versionstamp: stored?.versionstamp ?? null,
-    } as Deno.KvEntryMaybe<unknown>;
+    } as Deno.KvEntryMaybe<unknown>);
   },
   set: (key: Deno.KvKey, value: unknown) => {
     kvStore.put(key, value);
@@ -332,7 +334,7 @@ Deno.test("sampler keeps unused additional limits visible while deferring them f
   assert.equal(routingObservation.includes("GPT-5.3-Codex-Spark"), false);
 });
 
-Deno.test("sampler mirrors a reported Spark limit to an available sibling for the admin view", async () => {
+Deno.test("sampler keeps named limits on the reporting account only", async () => {
   seed();
   const live = await refreshProviderCapacity({
     kv: kvStub,
@@ -342,7 +344,7 @@ Deno.test("sampler mirrors a reported Spark limit to an available sibling for th
   const accountOne = live.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 1);
   const accountTwo = live.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 2);
   assert.equal(accountOne?.additional_rate_limits.length, 1);
-  assert.deepEqual(accountTwo?.additional_rate_limits, accountOne.additional_rate_limits);
+  assert.deepEqual(accountTwo?.additional_rate_limits, []);
 
   const storedSnapshot = kvStore.get(keyToString(PROVIDER_CAPACITY_SNAPSHOT_KEY))?.value as
     | {
@@ -353,7 +355,7 @@ Deno.test("sampler mirrors a reported Spark limit to an available sibling for th
 
   const persisted = await getPersistedProviderCapacityView({ kv: kvStub, now: () => nowMs });
   const persistedAccountTwo = persisted.sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === 2);
-  assert.deepEqual(persistedAccountTwo?.additional_rate_limits, accountTwo.additional_rate_limits);
+  assert.deepEqual(persistedAccountTwo?.additional_rate_limits, []);
   const routingStore = kvStore.get(keyToString(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY))?.value as
     | {
         observations?: readonly { slot: number; additional_rate_limits: readonly unknown[] }[];
@@ -1025,7 +1027,10 @@ Deno.test("capacity view backfills recent verified reset events from the redacte
   assert.equal(storedEventKeys.length, 1);
 });
 
-Deno.test("capacity endpoint reads persisted state by default and probes only for refresh=live", async () => {
+const codexSourceAt = (sources: readonly ProviderCapacitySource[], slot: 1 | 2): ProviderCapacityCodexSource | undefined =>
+  sources.find((source): source is ProviderCapacityCodexSource => source.source === "codex" && source.slot === slot);
+
+Deno.test("capacity endpoint revalidates stale reads and reuses fresh persisted snapshots", async () => {
   seed();
   kvStore.put(promptCacheAnalyticsCounterKey(nowMs, "input_tokens"), { value: 200n } as Deno.KvU64);
   kvStore.put(promptCacheAnalyticsCounterKey(nowMs, "cached_input_tokens"), { value: 100n } as Deno.KvU64);
@@ -1038,39 +1043,141 @@ Deno.test("capacity endpoint reads persisted state by default and probes only fo
     return createFetcher([], null)(input, init);
   };
 
-  const passive = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+  // Without a persisted snapshot a normal read revalidates instead of serving unavailable.
+  const initial = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
     kv: kvStub,
-    fetcher: () => Promise.reject(new Error("passive capacity must not fetch")),
+    fetcher,
     now: () => nowMs,
   });
-  assert.equal(passive.status, 200);
-  const passiveBody = (await passive.json()) as {
+  assert.equal(initial.status, 200);
+  const initialBody = (await initial.json()) as {
     cache_state?: string;
     prompt_cache?: {
       bucket_ms?: number;
       buckets?: { cached_percentage?: number; cache_write_input_tokens?: number }[];
     };
   };
-  assert.equal(passiveBody.cache_state, "unavailable");
-  assert.equal(passiveBody.prompt_cache?.bucket_ms, PROMPT_CACHE_ANALYTICS_BUCKET_MS);
-  assert.equal(passiveBody.prompt_cache.buckets?.[0]?.cached_percentage, 50);
-  assert.equal(passiveBody.prompt_cache.buckets[0]?.cache_write_input_tokens, 50);
-  assert.equal(calls, 0);
-
-  const live = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity?refresh=live"), { kv: kvStub, fetcher, now: () => nowMs });
-  assert.equal(live.status, 200);
-  assert.equal(((await live.json()) as { cache_state?: string }).cache_state, "live");
+  assert.equal(initialBody.cache_state, "live");
   assert.equal(calls, 3);
+  assert.equal(initialBody.prompt_cache?.bucket_ms, PROMPT_CACHE_ANALYTICS_BUCKET_MS);
+  assert.equal(initialBody.prompt_cache.buckets?.[0]?.cached_percentage, 50);
+  assert.equal(initialBody.prompt_cache.buckets[0]?.cache_write_input_tokens, 50);
 
-  const persisted = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+  // A read inside the freshness window serves the persisted snapshot and never probes.
+  const fresh = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
     kv: kvStub,
-    fetcher: () => Promise.reject(new Error("persisted capacity must not fetch")),
+    fetcher: () => Promise.reject(new Error("fresh capacity must not fetch")),
     now: () => nowMs + 1_000,
   });
-  const persistedBody = (await persisted.json()) as { cache_state?: string; history?: unknown[] };
-  assert.equal(persistedBody.cache_state, "persisted");
-  assert.equal(persistedBody.history?.length, 1);
+  const freshBody = (await fresh.json()) as { cache_state?: string; history?: unknown[] };
+  assert.equal(freshBody.cache_state, "persisted");
+  assert.equal(freshBody.history?.length, 1);
   assert.equal(calls, 3);
+
+  // `?refresh=live` still forces a probe inside the freshness window.
+  const live = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity?refresh=live"), {
+    kv: kvStub,
+    fetcher,
+    now: () => nowMs + 1_000,
+  });
+  assert.equal(((await live.json()) as { cache_state?: string }).cache_state, "live");
+  assert.equal(calls, 6);
+});
+
+Deno.test("stale default read delivers the changed upstream Codex quota value", async () => {
+  seed();
+  let primaryUsed = 80;
+  const usage = () => [primaryUsed, 20] as const;
+  await refreshProviderCapacity({ kv: kvStub, fetcher: createFetcher([], null, {}, usage), now: () => nowMs - 40_000 });
+  const before = await getPersistedProviderCapacityView({ kv: kvStub, now: () => nowMs - 39_000 });
+  assert.equal(codexSourceAt(before.sources, 1)?.windows.primary?.used_percent, 80);
+  assert.equal(before.cache_state, "persisted");
+
+  primaryUsed = 5;
+  const calls: { account: string | null; authorization: string | null; url: string }[] = [];
+  const changed = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+    kv: kvStub,
+    fetcher: createFetcher(calls, null, {}, usage),
+    now: () => nowMs,
+  });
+  const changedBody = (await changed.json()) as { cache_state?: string; sources?: readonly ProviderCapacitySource[] };
+  assert.equal(changedBody.cache_state, "live");
+  assert.equal(codexSourceAt(changedBody.sources ?? [], 1)?.windows.primary?.used_percent, 5);
+  assert.equal(calls.length, 3);
+});
+
+Deno.test("concurrent stale default reads share one upstream refresh", async () => {
+  seed();
+  await refreshProviderCapacity({ kv: kvStub, fetcher: createFetcher([]), now: () => nowMs - 40_000 });
+  const calls: { account: string | null; authorization: string | null; url: string }[] = [];
+  let releaseFetch = () => {};
+  const fetchReleased = new Promise<void>((resolve) => {
+    releaseFetch = () => {
+      resolve();
+    };
+  });
+  const fetcher = createGatedFetcher(
+    createFetcher(calls, null, {}, () => [5, 20]),
+    fetchReleased
+  );
+  const staleRequest = () =>
+    handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+      kv: kvStub,
+      fetcher,
+      now: () => nowMs,
+    });
+
+  const firstPromise = staleRequest();
+  const waitDeadline = Date.now() + 2_000;
+  while (calls.length < 3) {
+    assert.ok(Date.now() < waitDeadline, "stale refresh did not issue all provider calls");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const secondPromise = staleRequest();
+  // The first read holds the lease while its upstream calls are gated, so the
+  // second stale read must coalesce instead of probing again.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  releaseFetch();
+
+  const [first, second] = await Promise.all([firstPromise, secondPromise]);
+  const firstBody = (await first.json()) as { sources?: readonly ProviderCapacitySource[] };
+  const secondBody = (await second.json()) as { sources?: readonly ProviderCapacitySource[] };
+  assert.equal(calls.length, 3);
+  assert.equal(codexSourceAt(firstBody.sources ?? [], 1)?.windows.primary?.used_percent, 5);
+  assert.equal(codexSourceAt(secondBody.sources ?? [], 1)?.windows.primary?.used_percent, 5);
+});
+
+Deno.test("failed stale revalidation reports unavailable quota instead of zero", async () => {
+  seed();
+  await refreshProviderCapacity({ kv: kvStub, fetcher: createFetcher([]), now: () => nowMs - 40_000 });
+  const response = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+    kv: kvStub,
+    fetcher: createFetcher([], "account-one", {}, null, false, 1_800_011_000, 503),
+    now: () => nowMs,
+  });
+  const body = (await response.json()) as { sources?: readonly ProviderCapacitySource[] };
+  const failed = codexSourceAt(body.sources ?? [], 1);
+  assert.equal(failed?.state, "unavailable");
+  assert.equal(failed.failure_status, 503);
+  assert.equal(failed.windows.primary, null);
+  assert.equal(codexSourceAt(body.sources ?? [], 2)?.state, "available");
+});
+
+Deno.test("read freshness window stays separate from the fifteen-minute history bucket", async () => {
+  seed();
+  assert.equal(PROVIDER_CAPACITY_READ_FRESH_MS, 30_000);
+  assert.ok(PROVIDER_CAPACITY_READ_FRESH_MS < PROVIDER_CAPACITY_HISTORY_BUCKET_MS);
+  const bucketStartAtMs = Math.floor(nowMs / PROVIDER_CAPACITY_HISTORY_BUCKET_MS) * PROVIDER_CAPACITY_HISTORY_BUCKET_MS;
+  const read = (now: number) =>
+    handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
+      kv: kvStub,
+      fetcher: createFetcher([]),
+      now: () => now,
+    });
+  await read(nowMs);
+  await read(nowMs + 31_000);
+  const persisted = await getPersistedProviderCapacityView({ kv: kvStub, now: () => nowMs + 32_000 });
+  assert.equal(persisted.history.filter((point) => point.bucket_start_at_ms === bucketStartAtMs).length, 1);
 });
 
 // Both concurrent-refresh tests hold their provider calls open until the test releases them.
@@ -1204,7 +1311,7 @@ Deno.test("persisted Codex data becomes stale after the missed-run allowance", a
 });
 
 Deno.test("capacity route requires admin authentication", async () => {
-  const { default: handler } = await import("../src/handler.ts");
+  const { default: handler } = await import("../src/handler/index.ts");
   const response = await handler(new Request("https://ai.ubq.fi/admin/providers/capacity"));
   assert.equal(response.status, 401);
 });
@@ -1276,8 +1383,8 @@ Deno.test("event sampler persists capacity without building the discarded admin 
       "the event sampler must not enumerate history or reset-event projection prefixes"
     );
     // The quota refresh inside a sample also appends at most one hourly
-    // balance-history read plus one upsert, hence the 22-command ceiling.
-    assert.ok(samplerBudget.commands <= 22, `event sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
+    // balance-history read plus one upsert; the rollup read is the 23rd command.
+    assert.ok(samplerBudget.commands <= 23, `event sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
     assert.notEqual((await samplerKv.get(PROVIDER_CAPACITY_SNAPSHOT_KEY)).value, null);
     assert.notEqual((await samplerKv.get(providerCapacityHistoryKey(nowMs))).value, null);
     assert.notEqual((await samplerKv.get(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY)).value, null);

@@ -2,16 +2,19 @@ import assert from "node:assert/strict";
 
 // This suite asserts exact fetch and KV budgets, so the event-driven maintenance
 // hooks must not run in the background while it measures them.
-const { setProviderCapacitySampleTriggerForTest } = await import("../src/provider_capacity_events.ts");
-const { setPaidFallbackTerminalSweepForTest } = await import("../src/paid_fallback.ts");
+const { setProviderCapacitySampleTriggerForTest } = await import("../src/provider/capacity-events.ts");
+const { setPaidFallbackTerminalSweepForTest } = await import("../src/paid-fallback/index.ts");
 setProviderCapacitySampleTriggerForTest(() => {});
 setPaidFallbackTerminalSweepForTest(() => {});
 
-// The DeepSeek official route appends its models to the served catalog whenever
-// DEEPSEEK_API_KEY is configured. These tests assert exact catalog shapes from
-// stored snapshots and discovery sources only, so the ambient credential is
-// cleared to keep them independent of the machine that runs them.
+// The DeepSeek, LithosAI and OpenRouter routes append their models to the
+// served catalog whenever their credential is configured. These tests assert
+// exact catalog shapes from stored snapshots and discovery sources only, so the
+// ambient credentials are cleared to keep them independent of the machine that
+// runs them.
 Deno.env.delete("DEEPSEEK_API_KEY");
+Deno.env.delete("LITHOSAI_API_KEY");
+Deno.env.delete("OPENROUTER_API_KEY");
 
 const keyToString = (key: Deno.KvKey): string => JSON.stringify(key);
 const kvStore = new Map<string, { value: unknown; versionstamp: string }>();
@@ -96,18 +99,17 @@ const {
   CODEX_CATALOG_MAX_VERSIONS,
   CODEX_CATALOG_PREFIX,
   CODEX_CATALOG_RETENTION_MS,
-  getCodexCatalogMemoVersionsForTest,
-  handleCodexCatalogModels,
-  resetCodexCatalogMemoForTest,
-  storeCodexCatalog,
-} = await import("../src/codex_catalog.ts");
-const { resetCodexAuthCacheForTest } = await import("../src/codex.ts");
-const { handleModels } = await import("../src/openai.ts");
+} = await import("../src/catalog/types.ts");
+const { getCodexCatalogMemoVersionsForTest, resetCodexCatalogMemoForTest, storeCodexCatalog } = await import("../src/catalog/store.ts");
+const { handleCodexCatalogModels } = await import("../src/catalog/index.ts");
+const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
+const { handleModels } = await import("../src/models/catalog.ts");
 const { config } = await import("../src/config.ts");
-const { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS, resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } = await import("../src/metered.ts");
-const { fetchSurplusModels, resetSurplusModelsCacheForTest, SURPLUS_MODELS_CACHE_TTL_MS } = await import("../src/surplus.ts");
-const { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest } = await import("../src/openrouter_models.ts");
-const { loadRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } = await import("../src/runtime_config.ts");
+const { fetchMeteredModels, METERED_MODELS_CACHE_TTL_MS, resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } =
+  await import("../src/provider/metered.ts");
+const { fetchSurplusModels, resetSurplusModelsCacheForTest, SURPLUS_MODELS_CACHE_TTL_MS } = await import("../src/provider/surplus.ts");
+const { fetchOpenRouterModels, resetOpenRouterModelsCacheForTest } = await import("../src/models/openrouter-models.ts");
+const { loadRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } = await import("../src/runtime-config.ts");
 
 const AUTH_GENERATION = "auth-generation-test";
 const AUTH_KEY = ["ubq_ai", "codex_auth"] as const;
@@ -204,7 +206,7 @@ Deno.test("codex catalog: unversioned models retain the exact OpenAI list shape"
   assert.equal(payload.object, "list");
 });
 
-Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and forward ETags", async () => {
+Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and derive client ETags", async () => {
   seedBaseState("0.100.0");
   const originalFetch = globalThis.fetch;
   const calls: { url: string; headers: Headers }[] = [];
@@ -223,14 +225,14 @@ Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and
   try {
     const first = await handleCodexCatalogModels(request("0.144.3"), "0.144.3");
     assert.equal(first.status, 200);
-    assert.equal(first.headers.get("etag"), '"0.144.3"');
+    const etag = first.headers.get("etag") ?? "";
+    assert.match(etag, /^"uos-catalog-[a-f0-9]{32}"$/);
     assert.deepEqual(await first.json(), JSON.parse(catalogBody("0.144.3", { version_marker: "0.144.3" })));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, "https://chatgpt.com/backend-api/codex/models?client_version=0.144.3");
     assert.equal(calls[0].headers.get("cookie"), null);
     assert.notEqual(calls[0].headers.get("authorization"), "Bearer gateway-client-token");
     assert.match(calls[0].headers.get("user-agent") ?? "", /codex_cli_rs\/0\.144\.3/);
-
     const hit = await handleCodexCatalogModels(request("0.144.3"), "0.144.3");
     assert.equal(hit.headers.get("x-uos-cache"), "hit");
     assert.equal(calls.length, 1);
@@ -240,7 +242,7 @@ Deno.test("codex catalog: exact versions preserve rich JSON, isolate caches, and
     assert.equal(calls.length, 2);
     assert.equal(((await secondVersion.json()) as { version_marker?: string }).version_marker, "0.145.0");
 
-    const notModified = await handleCodexCatalogModels(request("0.144.3", { "If-None-Match": '"0.144.3"' }), "0.144.3");
+    const notModified = await handleCodexCatalogModels(request("0.144.3", { "If-None-Match": etag }), "0.144.3");
     assert.equal(notModified.status, 304);
     assert.equal(await notModified.text(), "");
     assert.equal(calls.length, 2);
@@ -411,7 +413,7 @@ Deno.test("codex catalog: stale catalogs signal response body transport failures
   }
 });
 
-Deno.test("codex catalog: stale ETags revalidate upstream and matching clients receive 304", async () => {
+Deno.test("codex catalog: stale upstream ETags revalidate upstream without validating client bytes", async () => {
   seedBaseState();
   const version = "0.150.1";
   await storeCodexCatalog(kvStub, {
@@ -429,10 +431,10 @@ Deno.test("codex catalog: stale ETags revalidate upstream and matching clients r
   };
   try {
     const response = await handleCodexCatalogModels(request(version, { "If-None-Match": '"catalog-etag"' }), version);
-    assert.equal(response.status, 304);
+    assert.equal(response.status, 200);
     assert.equal(response.headers.get("x-uos-cache"), "revalidated");
     assert.equal(upstreamIfNoneMatch, '"catalog-etag"');
-    assert.equal(await response.text(), "");
+    assert.equal(await response.text(), catalogBody(version));
   } finally {
     globalThis.fetch = originalFetch;
   }

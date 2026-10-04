@@ -15,7 +15,7 @@
  * content is never truncated to force a success and no usage is invented.
  */
 import { openaiError } from "../http.ts";
-import { setResponseCompletionTelemetry } from "../openai.ts";
+import { setResponseCompletionTelemetry } from "../openai-telemetry.ts";
 import { readJsonBody } from "../request.ts";
 import { JevClient } from "../../lib/jev_compaction/client.ts";
 import { compact } from "../../lib/jev_compaction/compact.ts";

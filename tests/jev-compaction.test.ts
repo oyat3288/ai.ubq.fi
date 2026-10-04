@@ -9,7 +9,7 @@ import {
 import { MAX_SUMMARY_CHARS, parseCodexInput, renderSummary, SUMMARY_MARKER } from "../lib/jev_compaction/codex_items.ts";
 import { collectToolCalls } from "../lib/jev_compaction/state.ts";
 import type { JevAsker, JevQuestions, JevResponse } from "../lib/jev_compaction/types.ts";
-import { getResponseTelemetry } from "../src/openai.ts";
+import { getResponseTelemetry } from "../src/openai-telemetry.ts";
 
 /**
  * Focused regression coverage for the gateway Jev compaction slice: the

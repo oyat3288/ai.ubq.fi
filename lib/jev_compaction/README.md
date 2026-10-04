@@ -27,6 +27,6 @@ trimmed export set. The selection algorithm, renderer, validation rules, batchin
 `maxRequestTokens` 30,000), per-request 30-second Jev bound and the 400,000-character summary cap are unchanged.
 
 The upstream HTTP server, CLI proxy, standalone service and root `package.json` were deliberately not copied; the
-gateway route in `src/handler.ts` calls the adapter in `src/jev_compaction/`. The two prototype acceptance harnesses in
+gateway route in `src/handler/terminal-route.ts` calls the adapter in `src/jev_compaction/`. The two prototype acceptance harnesses in
 this directory (`jev-compaction-smoke.ts` and `jev-codex-smoke.ts`) use the real gateway handler and either an injected
 or the real Jev asker; they are vendored with this prototype rather than product scripts.

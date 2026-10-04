@@ -20,11 +20,11 @@
  * never a credential, transcript, or provider payload.
  */
 import assert from "node:assert/strict";
-import { PAID_FALLBACK_NO_LIMIT } from "../../src/api_keys.ts";
-import { apiKeyPolicyFromHashRecord, apiKeyUsageV3RequestKey, apiKeyUsageV3WindowKey, resetApiKeyPolicyCacheForTest } from "../../src/api_key_policy.ts";
-import { DEEPSEEK_CHAT_COMPLETIONS_URL } from "../../src/deepseek.ts";
-import { setInferenceAdmissionControllerForTest } from "../../src/handler.ts";
-import { createInferenceAdmissionController } from "../../src/inference_admission.ts";
+import { PAID_FALLBACK_NO_LIMIT } from "../../src/api-keys.ts";
+import { apiKeyPolicyFromHashRecord, apiKeyUsageV3RequestKey, apiKeyUsageV3WindowKey, resetApiKeyPolicyCacheForTest } from "../../src/api-key-policy.ts";
+import { DEEPSEEK_CHAT_COMPLETIONS_URL } from "../../src/deepseek/index.ts";
+import { setInferenceAdmissionControllerForTest } from "../../src/handler/admission.ts";
+import { createInferenceAdmissionController } from "../../src/inference-admission.ts";
 import { setJevCompactionAskerForTest } from "../../src/jev_compaction/compaction.ts";
 import { setKvForTest } from "../../src/kv.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, ApiKeyUsageRequestV3, ApiKeyUsageWindowV3 } from "../../src/types.ts";
@@ -202,8 +202,8 @@ const startGateway = async (): Promise<{
   setKvForTest(kv);
   resetApiKeyPolicyCacheForTest();
   setInferenceAdmissionControllerForTest(createInferenceAdmissionController({ maxActive: 8, maxWaiting: 8, maxQueueWaitMs: 500 }));
-  const { default: handler } = await import("../../src/handler.ts");
-  const { createServeHandler } = await import("../../src/serve_handler.ts");
+  const { default: handler } = await import("../../src/handler/index.ts");
+  const { createServeHandler } = await import("../../src/handler/serve-handler.ts");
   const gateway = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen: () => {} }, createServeHandler(handler));
   return {
     url: `http://127.0.0.1:${(gateway.addr as Deno.NetAddr).port}`,
