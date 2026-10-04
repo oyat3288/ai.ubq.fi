@@ -1,14 +1,12 @@
 import assert from "node:assert/strict";
 
-import { iterateDeepSeekChatCompletionStream, normalizeDeepSeekChatCompletion } from "../src/deepseek.ts";
-import {
-  createDeepSeekResponsesStreamTranslator,
-  type DeepSeekResponsesEcho,
-  toDeepSeekResponsesChatBody,
-  toDeepSeekResponsesPayload,
-} from "../src/deepseek_responses.ts";
-import { createPaidProviderAttemptDeadline, createStreamFirstEventDeadline, createStreamSemanticDeadline } from "../src/inference_deadline.ts";
-import { isAnswerBearingCompletion } from "../src/openai.ts";
+import { normalizeDeepSeekChatCompletion } from "../src/deepseek/index.ts";
+import { iterateDeepSeekChatCompletionStream } from "../src/deepseek/stream.ts";
+import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload } from "../src/deepseek/responses-payload.ts";
+import { createDeepSeekResponsesStreamTranslator } from "../src/deepseek/responses-stream.ts";
+import { toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
+import { createPaidProviderAttemptDeadline, createStreamFirstEventDeadline, createStreamSemanticDeadline } from "../src/inference-deadline.ts";
+import { isAnswerBearingCompletion } from "../src/upstream-wire.ts";
 
 /**
  * Terminal and deadline parity for the DeepSeek Responses adapter (module
@@ -601,7 +599,7 @@ Deno.test("m04 parity: a normalized refusal delta reaches the streamed translato
   // other translator event uses (this translator emits no `sequence_number`).
   const refusalDelta = events.find((event) => event.type === "response.refusal.delta");
   assert.ok(refusalDelta);
-  assert.equal(refusalDelta.item_id, "resp_refusal_norm_msg_0");
+  assert.equal(refusalDelta.item_id, "msg_resp_refusal_norm_0");
   assert.equal(refusalDelta.output_index, 0);
   assert.equal(refusalDelta.content_index, 0);
   assert.equal(refusalDelta.delta, refusal);

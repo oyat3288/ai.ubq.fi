@@ -4,10 +4,6 @@ Production runs as `ai-ubq-fi.service` on `codex@vps.pavlovcik.com` (129.158.58.
 to `/home/codex/repos/ubiquity/ai.ubq.fi`.
 
 - `ops/ai-ubq-fi.service`: enabled systemd service; starts at boot and restarts after exit.
-- `scripts/serve-vps.ts`: authenticated listener on `127.0.0.1:7999`, with graceful shutdown.
-- `.env`: existing production credentials, mode 0600. `DENO_DEPLOY_TOKEN` remains the application's admin-token name.
-- `.data/kv.sqlite3`: persistent local KV. Never replace it during a code deployment.
-- `.data/releases/<full-git-sha>`: immutable code and assets; `.data/current` selects the release.
 - `ops/Caddyfile`: HTTPS reverse proxy, imported by `/etc/caddy/Caddyfile`.
 - `ops/caddy-ai-ubq-fi.conf`: narrow read-only mounts for Caddy, which otherwise cannot access home directories.
 - `.data/caddy/`: origin TLS key and certificate; the key stays on the VPS. The certificate expires on 2041-09-06.
@@ -40,15 +36,27 @@ git merge --ff-only origin/development
 deno task deploy:vps
 ```
 
-The command requires a clean tracked checkout, takes an exclusive deployment lock, archives the exact commit, stamps its
-Git identity, atomically selects the new release, restarts only the gateway, and checks the exact local health identity.
-It refuses to overwrite an existing release. Use `systemctl restart` to restart the current release.
+The command validates the canonical VPS repository root before anything else, then requires a clean tracked checkout on
+`development` whose `HEAD` exactly equals the existing `origin/development` tracking ref before it touches `.data`. It
+takes the exclusive deployment lock, revalidates the same checkout under that lock so a queued deployment cannot release
+a revision from before the wait, and only then captures the candidate commit, archives it, stamps its Git identity,
+atomically selects the new release, validates the composed Caddy configuration and applies it with
+`systemctl reload caddy`, restarts only the gateway, and checks the exact health identity on the loopback listener and
+on the public `https://ai.ubq.fi/health` route. It fails closed when the branch, `HEAD`, or tracking ref does not match,
+and it never fetches, pulls, or switches branches itself: if `origin/development` is missing or stale, refresh it with
+the existing `git fetch origin development` step above. It refuses to overwrite an existing release. Use
+`systemctl restart` to restart the current release.
 
 Verify authenticated inference and the public health route after deployment. A health response alone does not prove
 provider inference. The startup message, health body, and response headers identify the same immutable Git revision.
 
 To roll back code, atomically point `.data/current` to a previously accepted release and restart `ai-ubq-fi.service`.
 Preserve `.env` and `.data/kv.sqlite3`.
+
+After any repository change that touches `ops/ai-ubq-fi.service`, run `sudo systemctl daemon-reload` before the next
+restart: systemd keeps the previously loaded unit until it reloads. Releases created before the release-root launcher
+change are not rollback targets, because they execute the checkout's launcher and Deno configuration instead of their
+own. Keep a release created after this change as the rollback baseline.
 
 ## Data migration and recovery
 

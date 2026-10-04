@@ -2,10 +2,12 @@
 
 import { config } from "./src/config.ts";
 import { getKv } from "./src/kv.ts";
-import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/local_admin_auth.ts";
-import { ensureLocalDevelopmentApiKey } from "./src/local_development_key.ts";
-import { closeOptionalPromptCacheAnalytics, optionalPromptCacheAnalyticsSnapshot } from "./src/prompt_cache_analytics.ts";
-import { createServeHandler } from "./src/serve_handler.ts";
+import { migrateLegacyCodexResetOptOut } from "./src/codex/reset-settings.ts";
+import { configureAdminAuthForListener, configureAdminAuthPeerForRequest, parseServeRuntimeOptions } from "./src/auth/local-admin.ts";
+import { ensureLocalDevelopmentApiKey } from "./src/auth/local-development-key.ts";
+import { closeOptionalPromptCacheAnalytics, optionalPromptCacheAnalyticsSnapshot, prunePromptCacheAnalytics } from "./src/cache/prompt-analytics.ts";
+import { createServeHandler } from "./src/handler/serve-handler.ts";
+import { reconcileDuePaidFallbacksV3 } from "./src/paid-fallback/ledger-backfill.ts";
 
 /**
  * Bounded optional-telemetry shutdown for both launchers.
@@ -56,7 +58,58 @@ export const shutdownOptionalTelemetry = async (): Promise<void> => {
 };
 
 /**
- * No scheduled work runs in this process. Everything the deploy crons used to do
+ * The Mac startup event reconciles due billing and prunes its own KV once.
+ * Later terminal, admin-read and analytics-write events maintain that same KV;
+ * no periodic work runs while it is idle. The VPS launcher never calls this.
+ */
+export const startMacMaintenance = (kv: Deno.Kv): (() => Promise<void>) => {
+  let stopped = false;
+  let reconciliation: Promise<void> | null = null;
+  let pruning: Promise<void> | null = null;
+  let stopPromise: Promise<void> | null = null;
+
+  const reconcile = (): void => {
+    if (stopped || reconciliation) return;
+    reconciliation = (async () => {
+      try {
+        await reconcileDuePaidFallbacksV3(Date.now(), kv);
+      } catch (error) {
+        console.error("[ai.ubq.fi] Mac paid fallback reconciliation failed:", error instanceof Error ? error.message : String(error));
+      } finally {
+        reconciliation = null;
+      }
+    })();
+  };
+
+  const prune = (): void => {
+    if (stopped || pruning) return;
+    pruning = (async () => {
+      try {
+        const result = await prunePromptCacheAnalytics({ kv });
+        if (result.status === "unavailable") {
+          console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_unavailable" }));
+        }
+      } catch {
+        console.warn("[ai.ubq.fi] prompt_cache_analytics", JSON.stringify({ status: "prune_failed" }));
+      } finally {
+        pruning = null;
+      }
+    })();
+  };
+
+  reconcile();
+  prune();
+
+  return (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopped = true;
+    stopPromise = Promise.all([reconciliation ?? Promise.resolve(), pruning ?? Promise.resolve()]).then(() => {});
+    return stopPromise;
+  };
+};
+
+/**
+ * No scheduled work starts in this shared handler. Everything the deploy crons used to do
  * now happens because an event happened, and the mapping is deliberate:
  *
  * - "reconcile pending metered billing" (every minute) -> a paid-fallback request
@@ -70,11 +123,12 @@ export const shutdownOptionalTelemetry = async (): Promise<void> => {
  * - "prune prompt cache analytics" (hourly) -> the first analytics write in a new
  *   bucket (`src/prompt_cache_analytics.ts`).
  *
- * Consequences are intentional: with no traffic and no operator, nothing runs.
+ * Consequences are intentional for the shared handler: with no traffic and no operator, nothing runs.
  * Durable state (pending reconciliation markers, capacity buckets, retained
  * analytics) waits for the next event instead of a timer, and `deno.json` no
  * longer enables the `cron` unstable feature, so `Deno.cron` does not exist here.
- * See `docs/event-driven-maintenance.md`.
+ * The Mac launcher also checks due billing and analytics once on startup
+ * against its own KV, then the same event hooks handle subsequent work.
  */
 const serveHandler = createServeHandler();
 
@@ -96,6 +150,32 @@ if (runtimeOptions.disableAdminAuth) {
     console.warn("[ai.ubq.fi] Local development key provisioning failed:", error instanceof Error ? error.message : String(error));
   }
 }
+
+/**
+ * One bounded, idempotent pass materializes a persisted global banked-reset
+ * opt-out into per-subscription settings for the accounts in the current strong
+ * auth-pool snapshot. It is deliberately not awaited: the read path enforces the
+ * same opt-out and retries the same completion, whose single atomic commit is
+ * conditional on that snapshot, so a slow or unavailable KV cannot delay
+ * listener startup. An empty pool or a concurrent pool change leaves the marker
+ * unset and the next guarded read resumes; the legacy key is never deleted.
+ */
+const migrateCodexResetSettings = async (): Promise<void> => {
+  try {
+    const kv = await getKv();
+    if (!kv) return;
+    const status = await migrateLegacyCodexResetOptOut(kv);
+    if (status === "pending") {
+      console.warn(
+        "[ai.ubq.fi] Codex reset-settings migration waits for a configured account pool and an unchanged snapshot; the persisted global opt-out stays in force."
+      );
+    }
+  } catch (error) {
+    console.warn("[ai.ubq.fi] Codex reset-settings migration failed:", error instanceof Error ? error.message : String(error));
+  }
+};
+
+void migrateCodexResetSettings();
 
 const server: Deno.ServeDefaultExport = runtimeOptions.disableAdminAuth
   ? {

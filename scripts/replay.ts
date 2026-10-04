@@ -33,19 +33,17 @@
  * whose fields are enumerated classifications and counts, never captured bytes.
  */
 
+import { consumeDeepSeekBufferedChat, consumeDeepSeekChatStream } from "./replay-chat-stream.ts";
 import { config } from "../src/config.ts";
-import {
-  DEEPSEEK_CHAT_COMPLETIONS_URL,
-  DeepSeekError,
-  type DeepSeekStreamFrame,
-  DeepSeekStreamError,
-  fetchDeepSeekChatCompletions,
-  iterateDeepSeekChatCompletionStream,
-  normalizeDeepSeekChatCompletion,
-} from "../src/deepseek.ts";
-import { fetchMeteredResponses, METERED_BASE_URL } from "../src/metered.ts";
-import { collectBufferedResponses, isAnswerBearingCompletion } from "../src/openai.ts";
+import { DEEPSEEK_CHAT_COMPLETIONS_URL, DeepSeekError, fetchDeepSeekChatCompletions } from "../src/deepseek/index.ts";
+import { DeepSeekStreamError } from "../src/deepseek/stream.ts";
+import { LITHOS_CHAT_COMPLETIONS_URL } from "../src/provider/lithos.ts";
+import { fetchMeteredResponses, METERED_BASE_URL } from "../src/provider/metered.ts";
+import { OPENROUTER_CHAT_COMPLETIONS_URL } from "../src/provider/openrouter.ts";
+import { collectBufferedResponses } from "../src/responses-buffered.ts";
+
 import { MAX_ACCEPTED_JSON_BODY_BYTES } from "../src/request.ts";
+import { SENTINEL_REPLAY_REQUEST_FILE_MAX_BYTES, SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES } from "../src/sentinel/replay-limits.ts";
 import {
   createOwnedResponsesStream,
   type PreparedResponsesStream,
@@ -53,45 +51,34 @@ import {
   responseEventFromValue,
   responseIdFromEvents,
   responsesEventSemanticKind,
-} from "../src/responses_failover_stream.ts";
+} from "../src/responses-failover-stream.ts";
 import {
   preflightResponsesStream,
   readResponsesStream,
   ResponsesStreamError,
   type ResponsesStreamEvent,
   type ResponsesStreamIterator,
-} from "../src/responses_stream.ts";
+} from "../src/responses-stream.ts";
 import {
   parseSentinelUpstreamTrace,
-  SENTINEL_UPSTREAM_MAX_ATTEMPTS,
-  SENTINEL_UPSTREAM_MAX_BYTES,
-  SENTINEL_UPSTREAM_MAX_CHUNKS,
   type SentinelUpstreamAttempt,
   type SentinelUpstreamProvider,
   type SentinelUpstreamTerminal,
   type SentinelUpstreamTrace,
-} from "../src/sentinel_upstream_capture.ts";
-import { fetchSurplusResponses, SURPLUS_BASE_URL } from "../src/surplus.ts";
+} from "../src/sentinel/upstream-capture.ts";
+import { fetchSurplusResponses, SURPLUS_BASE_URL } from "../src/provider/surplus.ts";
 import { getString, isRecord } from "../src/utils.ts";
 import { createRecordedUpstreamReplay, type RecordedUpstreamReplay } from "../tests/helpers/sentinel-recorded-upstream.ts";
-
 const METADATA_FILE = ".sentinel-replay-input.json";
 const METADATA_MAX_BYTES = 16 * 1024;
 /**
- * Worst-case JSON size of one parser-accepted trace. Separately base64-encoded
- * chunks cannot share padding: each chunk adds at most three encoded characters
- * over the contiguous encoding, its two quotes and comma, and a version-2
- * timing entry of at most nine digits plus a separator. Each attempt adds its
- * fixed keys and clocks plus allowlisted header values of at most 512
- * characters. The parser still enforces the decoded byte, chunk and attempt
- * bounds, so this file guard only rejects input no valid trace can reach.
+ * Reader file bounds come from the same shared limit module the producer uses:
+ * the upstream envelope allows the full derived metadata allowance (base64
+ * chunks, timing, safe headers, framing); the request envelope allows the JSON
+ * escaping worst case while the decoded body stays capped at 32 MiB.
  */
-const UPSTREAM_CHUNK_JSON_OVERHEAD_BYTES = 16;
-const UPSTREAM_ATTEMPT_JSON_OVERHEAD_BYTES = 8 * 1024;
-const UPSTREAM_FILE_MAX_BYTES =
-  Math.ceil(SENTINEL_UPSTREAM_MAX_BYTES / 3) * 4 +
-  SENTINEL_UPSTREAM_MAX_CHUNKS * UPSTREAM_CHUNK_JSON_OVERHEAD_BYTES +
-  SENTINEL_UPSTREAM_MAX_ATTEMPTS * UPSTREAM_ATTEMPT_JSON_OVERHEAD_BYTES;
+const UPSTREAM_FILE_MAX_BYTES = SENTINEL_REPLAY_UPSTREAM_FILE_MAX_BYTES;
+const REQUEST_FILE_MAX_BYTES = SENTINEL_REPLAY_REQUEST_FILE_MAX_BYTES;
 const MAX_TEST_IDS = 64;
 const TEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,64}$/;
 const SYNTHETIC_PAID_API_KEY = "sentinel-replay-synthetic-key";
@@ -127,6 +114,13 @@ const PROVIDER_ROUTES: Readonly<Record<SentinelUpstreamProvider, string>> = Obje
   // The real DeepSeek endpoint: the recorded transport only answers the exact
   // URL the exported gateway transport dispatches to.
   deepseek: DEEPSEEK_CHAT_COMPLETIONS_URL,
+  // The real LithosAI endpoint, for the same reason. Replay coverage for this
+  // provider is not claimed here: the route is registered so the recorded
+  // transport's provider list matches the routes it is asked to validate.
+  lithos: LITHOS_CHAT_COMPLETIONS_URL,
+  // The supported OpenRouter Chat Completions endpoint, registered for the same
+  // reason: the recorded transport validates the route set it may be asked for.
+  openrouter: OPENROUTER_CHAT_COMPLETIONS_URL,
 });
 
 type SupportedProvider = "chatgpt_codex" | "surplus" | "metered" | "deepseek";
@@ -174,17 +168,17 @@ class UnavailableInput extends Error {
   }
 }
 
-const unavailable: () => never = () => {
+export const unavailable: () => never = () => {
   throw new UnavailableInput();
 };
 
 const encoder = new TextEncoder();
 
-const isPlainRecord = (value: unknown): value is Record<string, unknown> => isRecord(value) && !Array.isArray(value);
+export const isPlainRecord = (value: unknown): value is Record<string, unknown> => isRecord(value) && !Array.isArray(value);
 
 const decodeUtf8 = (bytes: Uint8Array): string => new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 
-const parseJson = (text: string): unknown => {
+export const parseJson = (text: string): unknown => {
   try {
     return JSON.parse(text);
   } catch {
@@ -279,7 +273,7 @@ const readDispatchInput = (cwd: string): DispatchInput => {
  * body itself, never by a provider guess.
  */
 const readRequestEnvelope = (cwd: string, requestPath: string): RequestEnvelope => {
-  const bytes = readBoundedFile(requireRegularFile(cwd, relativeSegments(requestPath)), MAX_ACCEPTED_JSON_BODY_BYTES);
+  const bytes = readBoundedFile(requireRegularFile(cwd, relativeSegments(requestPath)), REQUEST_FILE_MAX_BYTES);
   const parsed = parseJson(decodeUtf8(bytes));
   if (!isPlainRecord(parsed) || typeof parsed.body !== "string") unavailable();
   const bodyText = parsed.body;
@@ -661,109 +655,6 @@ const runReplaySequence = async (
 };
 
 /** Accumulates the answer-bearing view of the real normalized DeepSeek chunks. */
-type ChatStreamEvidence = {
-  normalizedChunks: number;
-  doneFrames: number;
-  malformed: boolean;
-  failureKind: string | null;
-  answerBearing: boolean;
-  terminalKind: "completed" | "premature_eof" | "read_error" | "other_failure" | "unavailable";
-};
-
-const emptyChatStreamEvidence = (): ChatStreamEvidence => ({
-  normalizedChunks: 0,
-  doneFrames: 0,
-  malformed: false,
-  failureKind: null,
-  answerBearing: false,
-  terminalKind: "unavailable",
-});
-
-/** Record one normalized choice's answer-bearing contribution without reimplementing the rule. */
-const observeChatChoice = (choice: unknown, evidence: ChatStreamEvidence): void => {
-  if (!isPlainRecord(choice) || !isPlainRecord(choice.delta)) return;
-  const toolCalls = Array.isArray(choice.delta.tool_calls) ? choice.delta.tool_calls.length : 0;
-  if (
-    isAnswerBearingCompletion({
-      text: typeof choice.delta.content === "string" ? choice.delta.content : "",
-      refusal: typeof choice.delta.refusal === "string" ? choice.delta.refusal : "",
-      toolCallCount: toolCalls,
-    })
-  ) {
-    evidence.answerBearing = true;
-  }
-};
-
-/** Record one validated DeepSeek stream frame; comments stay non-terminal and uncounted. */
-const observeChatFrame = (frame: DeepSeekStreamFrame, evidence: ChatStreamEvidence): void => {
-  if (frame.kind === "done") {
-    evidence.doneFrames += 1;
-    evidence.terminalKind = "completed";
-    return;
-  }
-  if (frame.kind !== "chunk") return;
-  evidence.normalizedChunks += 1;
-  const choices = Array.isArray(frame.value.choices) ? frame.value.choices : [];
-  for (const choice of choices) observeChatChoice(choice, evidence);
-};
-
-/** The fixed terminal kind recorded for one DeepSeek stream failure kind. */
-const chatFailureTerminalKind = (kind: string): ChatStreamEvidence["terminalKind"] => {
-  if (kind === "premature_eof") return "premature_eof";
-  if (kind === "read_error") return "read_error";
-  return "other_failure";
-};
-
-/** Record why the real DeepSeek stream iterator stopped. */
-const noteChatStreamFailure = (error: unknown, evidence: ChatStreamEvidence): void => {
-  if (!(error instanceof DeepSeekStreamError)) {
-    evidence.terminalKind = "other_failure";
-    return;
-  }
-  evidence.failureKind = error.kind;
-  evidence.terminalKind = chatFailureTerminalKind(error.kind);
-  if (error.kind === "malformed_event" || error.kind === "invalid_chunk") evidence.malformed = true;
-};
-
-/**
- * The real DeepSeek Chat Completions stream consumer: the gateway's own SSE
- * iterator parses and normalizes every frame, and the gateway's own
- * answer-bearing rule decides whether the accumulated output is usable.
- * Nothing here reimplements either.
- */
-const consumeDeepSeekChatStream = async (response: Response, model: string): Promise<ChatStreamEvidence> => {
-  const evidence = emptyChatStreamEvidence();
-  if (!response.body) unavailable();
-  try {
-    for await (const frame of iterateDeepSeekChatCompletionStream(response, model)) {
-      observeChatFrame(frame, evidence);
-    }
-  } catch (error) {
-    noteChatStreamFailure(error, evidence);
-  }
-  return evidence;
-};
-
-/** The buffered DeepSeek Chat Completions consumer: the real normalizer plus the real validity rule. */
-const consumeDeepSeekBufferedChat = async (response: Response, model: string): Promise<ConversationOutcome> => {
-  const parsed = parseJson(await response.text());
-  const normalized = normalizeDeepSeekChatCompletion(parsed, model);
-  if (!normalized.ok) return "invalid_completion";
-  const choices = Array.isArray(normalized.value.choices) ? normalized.value.choices : [];
-  const answerBearing = choices.some((choice) => {
-    if (!isPlainRecord(choice) || !isPlainRecord(choice.message)) return false;
-    const toolCalls = Array.isArray(choice.message.tool_calls) ? choice.message.tool_calls.length : 0;
-    return isAnswerBearingCompletion({
-      text: typeof choice.message.content === "string" ? choice.message.content : "",
-      refusal: typeof choice.message.refusal === "string" ? choice.message.refusal : "",
-      toolCallCount: toolCalls,
-    });
-  });
-  return answerBearing ? "completed" : "empty_completion";
-};
-
-/** Buffered Chat Completions verdict from the real normalizer and validity rule. */
-type ConversationOutcome = "completed" | "invalid_completion" | "empty_completion";
 
 const runAttempt = async (
   provider: SupportedProvider,

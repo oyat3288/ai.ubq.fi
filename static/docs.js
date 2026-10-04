@@ -1,6 +1,7 @@
 import "./network.js";
 
 const contentEl = document.querySelector("[data-docs-content]");
+const statusEl = document.querySelector("[data-docs-status]");
 const tocEl = document.querySelector("[data-docs-toc]");
 const source = contentEl?.dataset.docsSource;
 
@@ -122,6 +123,7 @@ const parseMarkdown = (markdown) => {
   let codeLines = [];
   let paragraph = [];
   let listType = null;
+  let listItem = null;
 
   const flushParagraph = () => {
     if (!paragraph.length) return;
@@ -130,8 +132,15 @@ const parseMarkdown = (markdown) => {
     paragraph = [];
   };
 
+  const flushListItem = () => {
+    if (listItem === null) return;
+    html.push(`<li>${listItem}</li>`);
+    listItem = null;
+  };
+
   const closeList = () => {
     if (!listType) return;
+    flushListItem();
     html.push(`</${listType}>`);
     listType = null;
   };
@@ -191,8 +200,9 @@ const parseMarkdown = (markdown) => {
         listType = type;
         html.push(`<${listType}>`);
       }
+      flushListItem();
       const itemText = listMatch[3] ?? "";
-      html.push(`<li>${renderInline(itemText.trim())}</li>`);
+      listItem = renderInline(itemText.trim());
       continue;
     }
 
@@ -211,9 +221,10 @@ const parseMarkdown = (markdown) => {
       continue;
     }
 
-    // A list item ends at the first line that is not an item, so close the open list before this
-    // paragraph accumulates; otherwise the emitted `<p>` lands inside the `<ul>`/`<ol>`.
-    closeList();
+    if (listItem !== null) {
+      listItem += ` ${renderInline(line.trim())}`;
+      continue;
+    }
     paragraph.push(line.trim());
   }
 
@@ -258,7 +269,12 @@ const setDocsState = (state) => {
   }
 };
 
+const setDocsStatus = (message) => {
+  if (statusEl) statusEl.textContent = message;
+};
+
 const renderDocsError = (message) => {
+  setDocsStatus(message);
   if (!contentEl) return;
   contentEl.innerHTML = `<p data-docs-error>${errorIcon}<span>${escapeHtml(message)}</span></p>`;
   setDocsState("error");
@@ -266,6 +282,8 @@ const renderDocsError = (message) => {
 
 const loadDocs = async () => {
   if (!contentEl) return;
+  setDocsStatus("Loading docs…");
+  setDocsState("loading");
   if (!source) {
     renderDocsError("Missing docs source.");
     return;
@@ -280,6 +298,7 @@ const loadDocs = async () => {
     const { html, toc } = parseMarkdown(text);
     contentEl.innerHTML = html;
     contentEl.querySelector("h1")?.remove();
+    setDocsStatus("");
     setDocsState("ready");
     renderToc(toc);
   } catch (error) {

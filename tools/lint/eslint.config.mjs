@@ -33,6 +33,9 @@ export default tsEslint.config(
       ".kv-migration/**",
       ".sentinel/**",
       ".diagnostics/**",
+      // Test-run fixtures (see scripts/file-size-ratchet.ts): a second verify pass
+      // must lint the same files as the first, not the previous run's evidence.
+      ".cleanup-evidence/**",
       "logs/**",
       "benchmark-runs/**",
     ],
@@ -63,8 +66,14 @@ export default tsEslint.config(
       "check-file/filename-naming-convention": [
         "error",
         {
-          "**/*.{js,ts}": "+([-._a-z0-9])",
+          // Any depth, not just the repository root: the rule's basename check
+          // covers the whole matched path.
+          "**/*.{js,ts}": "KEBAB_CASE",
         },
+        // Without this, every `*.test.ts` reports, because KEBAB_CASE rejects the
+        // dot in the middle extension. This option strips middle extensions before
+        // the check, so `static-auth.test.ts` validates as `static-auth`.
+        { ignoreMiddleExtensions: true },
       ],
       "prefer-arrow-callback": ["warn", { allowNamedFunctions: true }],
       // DIVERGENCE: the template forbids arrow functions entirely
@@ -156,14 +165,15 @@ export default tsEslint.config(
       "no-var": "error",
       "no-self-compare": "error",
       "no-useless-escape": "error",
-      // DIVERGENCE: OFF, measured. The template's 1000-line ceiling flagged 34
-      // files, and not marginally: src/openai.ts is 9597 lines,
-      // tests/openai-compat.test.ts is 13595, and 20 more are over 1200. This is
-      // a deliberate architecture decision in both the gateway core and its
-      // compatibility suite; satisfying the rule means splitting those modules,
-      // which is a refactor project rather than a lint fix. A warning nobody can
-      // ever clear only trains people to ignore lint output. Revisit as its own
-      // change if the modules are ever decomposed.
+      // DIVERGENCE: OFF, measured. The template's 1000-line ceiling flags 39
+      // files today, and not marginally: src/openai.ts is 14296 lines and
+      // tests/openai-compat.test.ts is 16756 (2026-09-23). This is a deliberate
+      // architecture decision in both the gateway core and its compatibility
+      // suite; satisfying the rule means splitting those modules, which is a
+      // refactor project rather than a lint fix. A warning nobody can ever clear
+      // only trains people to ignore lint output, so absolute size is ratcheted
+      // by scripts/file-size-ratchet.ts and file-size-baseline.json instead (see
+      // docs/DECISIONS.md); revisit decomposition as its own change.
       "max-lines": "off",
       // ---------------------------------------------------------------------
       // SONARJS/TS OVERLAP: the type-aware TS rule supersedes the sonarjs one,
@@ -267,10 +277,19 @@ export default tsEslint.config(
     // contortion. Narrower than turning the rule off: empty function
     // DECLARATIONS and empty methods in tests are still reported.
     // ---------------------------------------------------------------------
-    files: ["**/tests/**/*.ts", "**/benchmarks/**/*.ts"],
+    files: ["tests/**/*.ts", "benchmarks/**/*.ts"],
     rules: {
       "@typescript-eslint/no-empty-function": ["error", { allow: ["methods", "arrowFunctions"] }],
     },
+  },
+  {
+    // DIVERGENCE: this presenter regression executes only bounded functions
+    // from the tracked static/admin.js text in a fixture VM. No user input,
+    // application bootstrap, credentials or network enter that context.
+    // Measured 2026-10-03: the shipped status/DOM cases pass; code-eval alone
+    // flags this intentional execution. Keep the exception to this one test.
+    files: ["tests/admin-capacity-status.test.ts"],
+    rules: { "sonarjs/code-eval": "off" },
   },
   {
     // ---------------------------------------------------------------------
@@ -282,7 +301,7 @@ export default tsEslint.config(
     // "DENO_DEPLOY_TOKEN" used as lookup keys. sonarjs flags them by identifier
     // name, so renaming them would only hide the intent.
     // ---------------------------------------------------------------------
-    files: ["**/tests/kv-budget.test.ts", "**/tests/passkeys.test.ts", "**/tests/ubq-ai.test.ts"],
+    files: ["tests/kv-budget.test.ts", "tests/passkeys.test.ts", "tests/ubq-ai.test.ts"],
     rules: { "sonarjs/no-hardcoded-secrets": "off" },
   },
   {
@@ -297,7 +316,7 @@ export default tsEslint.config(
     // (`string & {}`, `${string}`, NonNullable<string>) is a no-op type trick
     // whose only purpose is to evade the rule -- `string & {}` is itself
     // rejected by sonarjs/no-useless-intersection on the same line.
-    files: ["**/src/defaults.ts"],
+    files: ["src/defaults.ts"],
     rules: { "sonarjs/redundant-type-aliases": "off" },
   },
   {
@@ -308,20 +327,20 @@ export default tsEslint.config(
     // categories (false -> boolean, record -> object) and the returns mix them
     // too, which is unavoidable while that sentinel exists. Its only built-in
     // escape is a `@returns` JSDoc tag; collapsing the sentinel would mean
-    // changing the wire contract in src/openai.ts, src/codex_catalog.ts and
-    // src/admin.ts. Measured: 3 findings, all three of these functions.
-    files: ["**/src/codex_models.ts"],
+    // changing the wire contract in src/openai.ts, src/catalog/index.ts and
+    // src/admin/index.ts. Measured: 3 findings, all three of these functions.
+    files: ["src/models/codex-models.ts"],
     rules: { "sonarjs/function-return-type": "off" },
   },
   {
     // DELIBERATE: the clear-text URL is the SUBJECT UNDER TEST. This asserts
     // that the gateway rejects a non-HTTPS Codex base before any
-    // credential-bearing request, which src/codex_banked_reset_provider.ts
+    // credential-bearing request, which src/codex/banked-reset-provider.ts
     // enforces on the protocol check. The rule has no options and its only
     // exemptions are hard-coded localhost/example host regexes, so silencing it
     // here would mean either changing the fixture host or splitting the literal
     // -- both would delete the case under test.
-    files: ["**/tests/codex-banked-reset-provider.test.ts"],
+    files: ["tests/codex-banked-reset-provider.test.ts"],
     rules: { "sonarjs/no-clear-text-protocols": "off" },
   }
 );
