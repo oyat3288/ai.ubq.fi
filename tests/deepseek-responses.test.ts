@@ -1,16 +1,10 @@
 import assert from "node:assert/strict";
 
-import {
-  createDeepSeekResponsesStreamTranslator,
-  type DeepSeekResponsesEcho,
-  deepSeekResponsesTerminalKind,
-  encodeResponsesEvent,
-  toDeepSeekChatMessages,
-  toDeepSeekResponsesChatBody,
-  toDeepSeekResponsesPayload,
-  toResponsesUsage,
-} from "../src/deepseek_responses.ts";
-import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek.ts";
+import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload, toResponsesUsage } from "../src/deepseek/responses-payload.ts";
+import { createDeepSeekResponsesStreamTranslator, deepSeekResponsesTerminalKind, encodeResponsesEvent } from "../src/deepseek/responses-stream.ts";
+import { toDeepSeekChatMessages, toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
+import { type ForwardedPayloadElision, FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
+import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek/index.ts";
 
 const echo: DeepSeekResponsesEcho = { tools: undefined, tool_choice: undefined, parallel_tool_calls: true, instructions: null };
 
@@ -206,9 +200,72 @@ Deno.test("deepseek responses: flattens namespaced tools and drops what the API 
     tools.map((tool) => tool.function.name),
     ["now", "clock_now", "sleep"]
   );
-  // A disambiguated name maps back to the name the client asked for.
-  assert.equal(toolNames.get("clock_now"), "now");
+  // A namespaced tool keeps the namespace the client resolves the call with, so
+  // a flattened Chat name round-trips to the exact Responses identity.
+  assert.deepEqual(toolNames.get("clock_now"), { name: "now", namespace: "clock" });
+  assert.deepEqual(toolNames.get("sleep"), { name: "sleep", namespace: "clock" });
+  assert.equal(toolNames.has("now"), false);
   assert.deepEqual(body.tool_choice, { type: "function", function: { name: "now" } });
+});
+
+Deno.test("deepseek responses: a namespaced tool call returns its namespace to the client", () => {
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: "hi",
+      tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] }],
+    },
+    "deepseek-v4-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const toolCall = { id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } };
+  const payload = toDeepSeekResponsesPayload(
+    chatCompletion({ content: "", tool_calls: [toolCall] }),
+    "deepseek-v4-flash",
+    "resp_ns",
+    echo,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
+    id: "fc_resp_ns_0_0",
+    type: "function_call",
+    status: "completed",
+    call_id: "call_1",
+    name: "spawn_agent",
+    namespace: "collaboration",
+    arguments: "{}",
+  });
+
+  const translator = createDeepSeekResponsesStreamTranslator(
+    "deepseek-v4-flash",
+    "resp_ns_stream",
+    echo,
+    1_780_000_000,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  translator.open();
+  const events = [
+    ...translator.push(chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } }] })),
+    ...translator.finish(),
+  ];
+  const added = events.find((event) => event.type === "response.output_item.added") as { item: Record<string, unknown> };
+  assert.equal(added.item.name, "spawn_agent");
+  assert.equal(added.item.namespace, "collaboration");
+  const completed = events.filter((event) => event.type === "response.completed");
+  assert.equal(completed.length, 1);
+  assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
+    {
+      id: "fc_resp_ns_stream_0",
+      type: "function_call",
+      status: "completed",
+      call_id: "call_1",
+      name: "spawn_agent",
+      namespace: "collaboration",
+      arguments: "{}",
+    },
+  ]);
 });
 
 Deno.test("deepseek responses: replays reasoning on tool turns because the provider requires it", () => {
@@ -473,7 +530,7 @@ Deno.test("deepseek responses: freeform tools round-trip through the function-on
     body.value.customToolNames
   );
   assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
-    id: "resp_1_ctc_0_0",
+    id: "ctc_resp_1_0_0",
     type: "custom_tool_call",
     status: "completed",
     call_id: "call_1",
@@ -522,8 +579,84 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
   const completed = events.filter((event) => event.type === "response.completed");
   assert.equal(completed.length, 1);
   assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
-    { id: "resp_1_fc_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
+    { id: "ctc_resp_1_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
   ]);
+});
+
+Deno.test("deepseek responses: projects a sub-agent message envelope onto a user turn", () => {
+  const plaintextPayload = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "delegate this" }] },
+      {
+        type: "agent_message",
+        author: "/root/probe_qwen2",
+        recipient: "/root",
+        content: [
+          { type: "input_text", text: "ok" },
+          // Multiple readable parts join in order, one newline between them.
+          { type: "input_text", text: "follow-up payload" },
+          // A thread whose model runs outside the ChatGPT backend carries its
+          // payload here in the clear, so it must reach the model.
+          { type: "encrypted_content", encrypted_content: "payload-from-worker" },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(plaintextPayload.ok, true);
+  assert.deepEqual(plaintextPayload.value, [
+    { role: "user", content: "delegate this" },
+    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\nfollow-up payload\npayload-from-worker" },
+  ]);
+
+  // A sealed payload is a Fernet token only the ChatGPT backend can open, so it
+  // is declared instead of forwarded as ciphertext.
+  const sealedPayload = toDeepSeekChatMessages(
+    [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK" },
+          { type: "encrypted_content", encrypted_content: `gAAAAA${"A".repeat(120)}` },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(sealedPayload.ok, true);
+  assert.deepEqual(sealedPayload.value, [
+    {
+      role: "user",
+      content: "[agent message] /root -> /root/worker:\nMessage Type: NEW_TASK\n[gateway: 1 sealed agent-message part(s) were not readable and omitted]",
+    },
+  ]);
+});
+
+Deno.test("deepseek responses: bounds oversized sub-agent payloads under the declared policy", () => {
+  const oversized = "x".repeat(FORWARDED_PAYLOAD_POLICY.perMessageLimit + 1_000);
+  const message = {
+    type: "agent_message",
+    author: "/root/worker",
+    recipient: "/root",
+    content: [{ type: "encrypted_content", encrypted_content: oversized }],
+  };
+  const elisions: ForwardedPayloadElision[] = [];
+  const reduced = toDeepSeekChatMessages([message], null, "reduce", elisions);
+  assert.equal(reduced.ok, true);
+  const content = (reduced.value[0] as { content: string }).content;
+  assert.ok(content.length < oversized.length, "the payload must be reduced below its original size");
+  assert.ok(content.includes(FORWARDED_PAYLOAD_POLICY.version), "the elision marker must name the policy version");
+  assert.equal(elisions.length, 1);
+  assert.equal(elisions[0].kind, "agent_message");
+  assert.ok(elisions[0].omittedBytes > 0);
+  assert.equal(elisions[0].path, "input[0].content");
+
+  // An explicit truncation "disabled" fails closed instead of mutating the input.
+  const rejected = toDeepSeekChatMessages([message], null, "reject", []);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "context_length_exceeded");
 });
 
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
@@ -558,7 +691,7 @@ Deno.test("deepseek responses: builds a completed Responses object from a Chat c
     "deepseek-v4-flash",
     "resp_test",
     echo,
-    new Map([["clock_now", "now"]])
+    new Map([["clock_now", { name: "now", namespace: "clock" }]])
   );
   assert.equal(payload.object, "response");
   assert.equal(payload.status, "completed");
@@ -697,7 +830,7 @@ Deno.test("deepseek responses: the reasoning item announces the index it answers
   // The item lifecycle must therefore exist before any later item advances the
   // index, and every reasoning event must name that item's own index and id.
   const responseId = "resp_reason_life";
-  const reasoningId = `${responseId}_rs_0`;
+  const reasoningId = `rs_${responseId}_0`;
   const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", responseId, echo, 1_780_000_000);
   const events: Record<string, unknown>[] = [];
   events.push(...translator.push(chatChunk({ role: "assistant", reasoning_content: "first " })));
@@ -779,7 +912,7 @@ Deno.test("deepseek responses: stream translator accumulates fragmented tool cal
   ]);
   const done = events.find((event) => event.type === "response.output_item.done") as { item: Record<string, unknown> };
   assert.deepEqual(done.item, {
-    id: "resp_tools_fc_0",
+    id: "fc_resp_tools_0",
     type: "function_call",
     status: "completed",
     call_id: "call_1",
@@ -1001,6 +1134,55 @@ Deno.test("deepseek responses: a truncated stream reports response.incomplete in
   );
 });
 
+Deno.test("deepseek responses: a length-truncated tool call closes incomplete before the terminal", () => {
+  // A `length` stop can land mid-arguments. Closing the item as `completed`
+  // before the `response.incomplete` terminal hands a status-aware consumer a
+  // partial call it may execute, so the terminal disposition is decided first
+  // and both tool kinds carry the official non-completed status in the done
+  // event and in the delivered output.
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_len_tool", echo, 1_780_000_000, new Map(), new Set(["exec"]));
+  const events: Record<string, unknown>[] = [];
+  events.push(
+    ...translator.push(
+      chatChunk(
+        {
+          role: "assistant",
+          tool_calls: [
+            { index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"echo hi' } },
+            { index: 1, id: "call_2", type: "function", function: { name: "exec", arguments: '{"input":"print(' } },
+          ],
+        },
+        { finish_reason: "length" }
+      )
+    )
+  );
+  events.push(...translator.finish());
+
+  const doneIndexes = events.flatMap((event, index) => (event.type === "response.output_item.done" ? [index] : []));
+  assert.equal(doneIndexes.length, 2);
+  const itemDones = doneIndexes.map((index) => events[index] as { item: Record<string, unknown> });
+  assert.deepEqual(
+    itemDones.map((done) => done.item),
+    [
+      { id: "fc_resp_len_tool_0", type: "function_call", status: "incomplete", call_id: "call_1", name: "shell", arguments: '{"cmd":"echo hi' },
+      { id: "ctc_resp_len_tool_1", type: "custom_tool_call", status: "incomplete", call_id: "call_2", name: "exec", input: '{"input":"print(' },
+    ]
+  );
+  // The terminal output carries the exact items the done events announced, and
+  // every item closes before the terminal it now agrees with.
+  const terminal = events.at(-1) as { type: string; response: Record<string, unknown> };
+  assert.equal(terminal.type, "response.incomplete");
+  assert.deepEqual(
+    terminal.response.output,
+    itemDones.map((done) => done.item)
+  );
+  assert.equal(doneIndexes[1] < events.length - 1, true);
+  assert.equal(
+    events.some((event) => event.type === "response.completed"),
+    false
+  );
+});
+
 Deno.test("deepseek responses: a provider interruption is a failed terminal, not a completion", () => {
   for (const [reason, code] of [
     ["insufficient_system_resource", "insufficient_system_resource"],
@@ -1056,105 +1238,180 @@ Deno.test("deepseek responses: a normal stream is still reported as completed", 
   assert.equal(terminal.response.error, null);
 });
 
+Deno.test("deepseek responses: bounds oversized forwarded payloads under the declared policy", () => {
+  const limit = FORWARDED_PAYLOAD_POLICY.perMessageLimit;
+  const messages = (result: ReturnType<typeof toDeepSeekChatMessages>): Record<string, unknown>[] => {
+    if (!result.ok) throw new Error(`unexpected projection failure: ${result.message}`);
+    return result.value;
+  };
+
+  // A single tool result larger than the per-message bound is cut, not forwarded
+  // whole: the provider counts it as text tokens and one such result took a live
+  // session past the 1,048,576-token window on 2026-09-24. The reduction is
+  // visible - the marker names the declared policy version and says the model
+  // did not receive the elided bytes - and the forwarded content stays inside
+  // the declared limit.
+  const oversized = "x".repeat(limit + 1_024);
+  const bounded = messages(
+    toDeepSeekChatMessages(
+      [
+        { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+        { type: "function_call_output", call_id: "call_big", output: oversized },
+      ],
+      null
+    )
+  );
+  const toolContent = (bounded.at(-1) as { content: string }).content;
+  assert.equal(toolContent.length < oversized.length, true);
+  assert.equal(toolContent.includes("bytes omitted"), true);
+  assert.equal(toolContent.includes(FORWARDED_PAYLOAD_POLICY.version), true);
+  assert.equal(toolContent.includes("the model did not receive the elided bytes"), true);
+  assert.equal(new TextEncoder().encode(toolContent).byteLength <= limit, true);
+
+  // Payloads inside the bound are untouched, so ordinary tool results replay verbatim.
+  const verbatim = messages(toDeepSeekChatMessages([{ type: "function_call_output", call_id: "call_small", output: "2026-09-16" }], null));
+  assert.deepEqual(verbatim.at(-1), { role: "tool", tool_call_id: "call_small", content: "2026-09-16" });
+
+  // An oversized image data URL is dropped rather than cut (half a base64
+  // payload is not an image) and the omission marker says the model did not
+  // receive the image, while an ordinary data URL still forwards as an image.
+  const hugeImage = `data:image/png;base64,${"A".repeat(limit + 10)}`;
+  const dropped = messages(toDeepSeekChatMessages([{ type: "message", role: "user", content: [{ type: "input_image", image_url: hugeImage }] }], null));
+  const droppedContent = (dropped.at(-1) as { content: unknown }).content;
+  assert.equal(typeof droppedContent, "string");
+  assert.equal(String(droppedContent).includes("image omitted"), true);
+  assert.equal(String(droppedContent).includes(FORWARDED_PAYLOAD_POLICY.version), true);
+  assert.equal(String(droppedContent).includes("the model did not receive this image"), true);
+
+  const smallImage = "data:image/png;base64,AQID";
+  const kept = messages(toDeepSeekChatMessages([{ type: "message", role: "user", content: [{ type: "input_image", image_url: smallImage }] }], null));
+  assert.deepEqual((kept.at(-1) as { content: unknown }).content, [{ type: "image_url", image_url: { url: smallImage } }]);
+
+  // An explicit `truncation: "disabled"` fails closed instead of reducing: the
+  // error names the input path, the byte counts and the declared limit, and it
+  // is recoverable without re-deriving which item was too large.
+  const refused = toDeepSeekResponsesChatBody(
+    {
+      input: [
+        { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+        { type: "function_call_output", call_id: "call_big", output: oversized },
+      ],
+      truncation: "disabled",
+    },
+    "deepseek-flash",
+    false
+  );
+  if (refused.ok) throw new Error("expected a fail-closed projection");
+  assert.equal(refused.code, "context_length_exceeded");
+  assert.equal(refused.param, "input[1].output");
+  assert.equal(refused.message.includes(`carries ${oversized.length} bytes`), true);
+  assert.equal(refused.message.includes(`at most ${limit} bytes per message under ${FORWARDED_PAYLOAD_POLICY.version}`), true);
+  assert.equal(refused.message.includes("truncation 'disabled'"), true);
+
+  // The request path records every reduction for the operator log, and the
+  // absent field or an explicit `"auto"` keep the declared bounded policy.
+  const elisionBody = (truncation: unknown) =>
+    toDeepSeekResponsesChatBody(
+      {
+        input: [
+          { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+          { type: "function_call_output", call_id: "call_big", output: oversized },
+          { type: "message", role: "user", content: [{ type: "input_image", image_url: hugeImage }] },
+        ],
+        ...(truncation === undefined ? {} : { truncation }),
+      },
+      "deepseek-flash",
+      false
+    );
+  for (const truncation of [undefined, "auto"]) {
+    const translated = elisionBody(truncation);
+    if (!translated.ok) throw new Error("expected a bounded projection");
+    assert.equal(translated.value.elisions.length, 2);
+    const [toolElision, imageElision] = translated.value.elisions;
+    assert.deepEqual(
+      Object.keys(toolElision).sort((a, b) => a.localeCompare(b)),
+      ["callId", "forwardedBytes", "kind", "omittedBytes", "originalBytes", "path"]
+    );
+    assert.equal(toolElision.path, "input[1].output");
+    assert.equal(toolElision.callId, "call_big");
+    assert.equal(toolElision.kind, "tool_output");
+    assert.equal(toolElision.originalBytes, new TextEncoder().encode(oversized).byteLength);
+    assert.equal(toolElision.forwardedBytes <= limit, true);
+    assert.equal(toolElision.omittedBytes > 0, true);
+    assert.equal(imageElision.path, "input[2].content[0]");
+    assert.equal(imageElision.callId, null);
+    assert.equal(imageElision.kind, "image");
+    assert.equal(imageElision.originalBytes, new TextEncoder().encode(hugeImage).byteLength);
+    assert.equal(imageElision.omittedBytes, new TextEncoder().encode(hugeImage).byteLength);
+  }
+
+  // Any other truncation value is rejected rather than guessed at.
+  const bogus = toDeepSeekResponsesChatBody({ input: "hi", truncation: "sometimes" }, "deepseek-flash", false);
+  if (bogus.ok) throw new Error("expected an unsupported-value failure");
+  assert.equal(bogus.param, "truncation");
+  assert.equal(bogus.code, undefined);
+});
+
 // ---------------------------------------------------------------------------
 // Replayed Codex item shapes.
 //
 // A Codex thread replays its stored history on every request, so an item shape
-// the adapter refuses cannot be cleared by repairing one thread. Both fixtures
-// below are reductions of records captured on this host.
+// the adapter refuses cannot be cleared by repairing one thread.
 // ---------------------------------------------------------------------------
 
-const replayedAgentMessage = (content: readonly Record<string, unknown>[]) => ({
-  type: "agent_message",
-  id: "amsg_01a0c77c-9203-7930-b68b-5fe2221a7393",
-  author: "/root",
-  recipient: "/root/deepseek_delivery_diagnostic",
-  content,
-  internal_chat_message_metadata_passthrough: { turn_id: "turn_1" },
-});
-
-const agentMessageEnvelope = "Message Type: NEW_TASK\nTask name: /root/deepseek_delivery_diagnostic\nSender: /root\nPayload:\n";
-
-const codexTuiToolOutput = {
-  type: "function_call_output",
-  name: "send_message_to_thread",
-  namespace: "codex_tui",
-  output: "<codex_delegation>\n  <input>Continue the task</input>\n</codex_delegation>",
-};
-
-Deno.test("deepseek responses: a replayed agent_message translates instead of failing", () => {
-  const translated = toDeepSeekResponsesChatBody(
-    {
-      input: [
-        { type: "message", role: "user", content: "keep going" },
-        replayedAgentMessage([
-          { type: "input_text", text: agentMessageEnvelope },
-          { type: "encrypted_content", encrypted_content: "gAAAAABqsg" },
-        ]),
-      ],
-    },
-    "deepseek-flash",
-    false
+Deno.test("deepseek responses: a call_id-less function_call_output is skipped, not fatal", () => {
+  // Codex's app-server replays a named unpaired output (`name`/`namespace`, no
+  // `call_id`) for a tool its own client ran. Chat can only answer a preceding
+  // `tool_calls` entry, so the output is dropped rather than re-paired by name;
+  // a paired output beside it still replays normally.
+  const codexTuiToolOutput = {
+    type: "function_call_output",
+    name: "send_message_to_thread",
+    namespace: "codex_tui",
+    output: "<codex_delegation>\n  <input>Continue the task</input>\n</codex_delegation>",
+  };
+  const translated = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: "deliver it" },
+      codexTuiToolOutput,
+      { type: "function_call_output", call_id: "call_1", output: "paired output" },
+    ],
+    null
   );
-
   assert.equal(translated.ok, true);
-  // The readable envelope replays as a user turn; the opaque encrypted_content
-  // part has no Chat field and is not forwarded.
-  assert.deepEqual(translated.value.body.messages, [
-    { role: "user", content: "keep going" },
-    { role: "user", content: agentMessageEnvelope },
+  assert.deepEqual(translated.value, [
+    { role: "user", content: "deliver it" },
+    { role: "tool", tool_call_id: "call_1", content: "paired output" },
   ]);
-});
 
-Deno.test("deepseek responses: an agent_message with no readable text is skipped", () => {
-  const translated = toDeepSeekResponsesChatBody(
-    {
-      input: [{ type: "message", role: "user", content: "keep going" }, replayedAgentMessage([{ type: "encrypted_content", encrypted_content: "gAAAAABqsg" }])],
-    },
-    "deepseek-flash",
-    false
-  );
-  assert.equal(translated.ok, true);
-  assert.deepEqual(translated.value.body.messages, [{ role: "user", content: "keep going" }]);
-});
-
-Deno.test("deepseek responses: a named unpaired function_call_output is skipped, not fatal", () => {
-  const translated = toDeepSeekResponsesChatBody(
-    { input: [{ type: "message", role: "user", content: "deliver it" }, codexTuiToolOutput] },
-    "deepseek-flash",
-    false
-  );
-  assert.equal(translated.ok, true);
-  // Chat has no unpaired tool-result channel: the output is dropped rather than
-  // answered to a call id it never had.
-  assert.deepEqual(translated.value.body.messages, [{ role: "user", content: "deliver it" }]);
   // A freeform output shares the branch and the same rule.
-  const customOutput = toDeepSeekResponsesChatBody(
-    {
-      input: [
-        { type: "message", role: "user", content: "deliver it" },
-        { type: "custom_tool_call_output", output: "freeform" },
-      ],
-    },
-    "deepseek-flash",
-    false
+  const customOutput = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: "deliver it" },
+      { type: "custom_tool_call_output", output: "freeform" },
+    ],
+    null
   );
   assert.equal(customOutput.ok, true);
-  assert.deepEqual(customOutput.value.body.messages, [{ role: "user", content: "deliver it" }]);
+  assert.deepEqual(customOutput.value, [{ role: "user", content: "deliver it" }]);
+
   // With nothing representable left to send, the request still fails, but for
   // the honest reason: there is no message, not a rejected item shape.
   const toolOutputOnly = toDeepSeekResponsesChatBody({ input: [codexTuiToolOutput] }, "deepseek-flash", false);
   assert.equal(toolOutputOnly.ok, false);
+  assert.equal(toolOutputOnly.param, "input");
   assert.equal(toolOutputOnly.message, "input must contain at least one message");
 });
 
-Deno.test("deepseek responses: malformed items that should fail still fail", () => {
-  // A function_call without its call_id/name pair is still a protocol violation.
-  const callWithoutId = toDeepSeekResponsesChatBody({ input: [{ type: "function_call", name: "lookup" }] }, "deepseek-flash", false);
+Deno.test("deepseek responses: malformed function_call and unknown item types still fail", () => {
+  // A function_call without its call_id/name pair remains a protocol violation.
+  const callWithoutId = toDeepSeekChatMessages([{ type: "function_call", name: "lookup" }], null);
   assert.equal(callWithoutId.ok, false);
+  assert.equal(callWithoutId.param, "input");
   assert.equal(callWithoutId.message, "function_call items require call_id and name");
   // An unknown item type is still refused instead of being approximated.
-  const unknownItem = toDeepSeekResponsesChatBody({ input: [{ type: "computer_call", call_id: "c" }] }, "deepseek-flash", false);
+  const unknownItem = toDeepSeekChatMessages([{ type: "computer_call", call_id: "c" }], null);
   assert.equal(unknownItem.ok, false);
   assert.equal(unknownItem.param, "input.type");
+  assert.equal(unknownItem.message, "input item type 'computer_call' is not supported");
 });

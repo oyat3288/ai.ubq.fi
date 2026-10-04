@@ -112,6 +112,99 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     return { setActive: () => {} };
   }
 
+  // Upstream provider strip: the same registry the Providers tab manages,
+  // rendered here so the supervisor panel reports what the gateway can dispatch
+  // to without switching tabs. Read-only, best effort, and never cached.
+  const providersCard = document.createElement("article");
+  providersCard.dataset.card = "";
+  providersCard.id = "supervisor-providers-card";
+  const providersHeader = document.createElement("header");
+  const providersEyebrow = document.createElement("span");
+  providersEyebrow.dataset.adminEyebrow = "";
+  providersEyebrow.textContent = "Read-only observation";
+  const providersTitle = document.createElement("h2");
+  providersTitle.id = "card-supervisor-providers";
+  providersTitle.textContent = "Upstream providers";
+  const providersNote = document.createElement("p");
+  providersNote.textContent =
+    "Health and activation of every gateway upstream, read from the same registry the Providers tab manages.";
+  providersHeader.append(providersEyebrow, providersTitle, providersNote);
+  const providersBody = document.createElement("div");
+  providersBody.dataset.cardBody = "";
+  const providersList = document.createElement("div");
+  providersList.dataset.providerList = "";
+  providersList.setAttribute("role", "list");
+  providersBody.append(providersList);
+  providersCard.setAttribute("aria-labelledby", providersTitle.id);
+  providersCard.append(providersHeader, providersBody);
+  section.append(providersCard);
+
+  const providerStateLabel = (health) => {
+    const state = typeof health?.state === "string" && health.state ? health.state : "unknown";
+    return health?.stale === true ? `${state} · stale` : state;
+  };
+
+  const renderProviders = (selection, healthSnapshot) => {
+    const entries = Array.isArray(selection?.data?.providers) ? selection.data.providers : [];
+    if (entries.length === 0) return;
+    const rows = entries.map((entry) => {
+      const health = typeof entry?.health_key === "string" && entry.health_key
+        ? healthSnapshot?.[entry.health_key]
+        : null;
+      const configured = health ? health.configured !== false : entry.configured === true;
+      const state = health ? (typeof health.state === "string" ? health.state : health.health?.state) : null;
+      const row = document.createElement("div");
+      row.dataset.providerEntry = "";
+      row.dataset.providerId = entry.id;
+      row.setAttribute("role", "listitem");
+      const body = document.createElement("span");
+      body.dataset.providerBody = "";
+      const name = document.createElement("span");
+      name.dataset.providerName = "";
+      name.textContent = entry.label ?? entry.id;
+      const badges = document.createElement("span");
+      badges.dataset.providerBadges = "";
+      const tier = document.createElement("span");
+      tier.dataset.providerTierBadge = entry.tier;
+      tier.textContent = entry.tier_label ?? entry.tier;
+      const badge = document.createElement("span");
+      badge.dataset.providerHealthBadge = configured ? (state ?? "unknown") : "unknown";
+      badge.textContent = configured
+        ? `Health ${providerStateLabel({ state: state ?? "unknown", stale: health?.stale === true })}`
+        : "Not configured";
+      badges.append(tier, badge);
+      body.append(name, badges);
+      const detail = document.createElement("span");
+      detail.dataset.providerDetail = "";
+      detail.textContent = entry.detail ?? "";
+      const meta = document.createElement("span");
+      meta.dataset.providerMeta = "";
+      const facts = [`${entry.model_count ?? 0} catalog models`, (entry.endpoints ?? []).join(" · ")];
+      meta.textContent = facts.filter((fact) => fact !== "").join(" · ");
+      body.append(detail, meta);
+      row.append(body);
+      return row;
+    });
+    providersList.replaceChildren(...rows);
+  };
+
+  const loadProviders = async () => {
+    if (!active || !isSuperAdmin()) return;
+    const token = typeof getToken === "function" ? getToken() : "";
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    try {
+      const [selectionResponse, healthResponse] = await Promise.all([
+        fetch(apiUrl("/admin/providers/selection"), { headers, credentials: "include", cache: "no-store" }),
+        fetch(apiUrl("/admin/providers"), { headers, credentials: "include", cache: "no-store" }),
+      ]);
+      const selection = selectionResponse.ok ? await selectionResponse.json().catch(() => null) : null;
+      const healthSnapshot = healthResponse.ok ? await healthResponse.json().catch(() => null) : null;
+      if (selection) renderProviders(selection, healthSnapshot);
+    } catch {
+      // Best effort: the sessions panel already reports its own load state.
+    }
+  };
+
   let active = false;
   let timer = 0;
   let controller = null;
@@ -246,23 +339,42 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     }
   };
 
+  // One flat row per session. The summary is the overview - status, title, machine,
+  // repository, age - and the disclosed body holds the diagnostics and the actions.
+  // The summary is phrasing content only, as the element requires.
   const buildRow = (key) => {
     const row = document.createElement("article");
     row.dataset.key = "supervisor-session";
     row.dataset.sessionKey = key;
-    const header = document.createElement("header");
+    row.setAttribute("role", "listitem");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const head = document.createElement("span");
+    head.dataset.supervisorOverview = "head";
     const title = document.createElement("strong");
     title.dataset.role = "supervisor-title";
     const machine = document.createElement("span");
     machine.dataset.muted = "";
     machine.dataset.role = "supervisor-machine";
-    header.append(title, machine);
-    const meta = document.createElement("div");
-    meta.dataset.meta = "usage";
-    for (const role of ["state", "place", "model", "activity", "tokens"]) {
+    head.append(title, machine);
+    const meta = document.createElement("span");
+    meta.dataset.supervisorOverview = "meta";
+    for (const role of ["state", "place", "activity"]) {
       const item = document.createElement("span");
       item.dataset.role = `supervisor-${role}`;
       meta.append(item);
+    }
+    summary.append(head, meta);
+    const body = document.createElement("div");
+    body.dataset.supervisorDisclosure = "";
+    const path = document.createElement("code");
+    path.dataset.role = "supervisor-path";
+    const facts = document.createElement("div");
+    facts.dataset.supervisorFacts = "";
+    for (const role of ["model", "tokens", "sampled"]) {
+      const item = document.createElement("span");
+      item.dataset.role = `supervisor-${role}`;
+      facts.append(item);
     }
     const actions = document.createElement("div");
     actions.dataset.layout = "row";
@@ -281,7 +393,9 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     briefButton.dataset.action = "brief";
     briefButton.textContent = "Catch me up";
     actions.append(id, copy, followButton, briefButton);
-    row.append(header, meta, actions);
+    body.append(path, facts, actions);
+    details.append(summary, body);
+    row.append(details);
     return row;
   };
 
@@ -293,8 +407,10 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     const machine = row.querySelector('[data-role="supervisor-machine"]');
     const state = row.querySelector('[data-role="supervisor-state"]');
     const place = row.querySelector('[data-role="supervisor-place"]');
+    const path = row.querySelector('[data-role="supervisor-path"]');
     const model = row.querySelector('[data-role="supervisor-model"]');
     const activity = row.querySelector('[data-role="supervisor-activity"]');
+    const sampled = row.querySelector('[data-role="supervisor-sampled"]');
     const tokens = row.querySelector('[data-role="supervisor-tokens"]');
     const id = row.querySelector('[data-role="supervisor-id"]');
     if (title) setText(title, text(session.title) ?? "(untitled session)");
@@ -306,20 +422,19 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
     }
     if (place) {
       const repo = repoOf(session.cwd);
-      const bits = [repo, session.branch, session.cwd].filter((value) => typeof value === "string" && value.length > 0);
-      setText(place, bits.length > 0 ? bits.join(" · ") : "cwd unavailable");
+      const bits = [repo, session.branch].filter((value) => typeof value === "string" && value.length > 0);
+      setText(place, bits.length > 0 ? bits.join(" · ") : "repository unknown");
     }
+    if (path) setText(path, text(session.cwd) ?? "cwd unavailable");
     if (model) {
       const bits = [session.model, session.effort, session.sourceKind].filter((value) =>
         typeof value === "string" && value.length > 0
       );
       setText(model, bits.length > 0 ? bits.join(" · ") : "model unavailable");
     }
-    if (activity) {
-      const age = formatAge(session.lastActivityAtMs);
-      const sampled = formatClock(session.lastSampledAtMs);
-      setText(activity, age ? `active ${age} · sampled ${sampled}` : `sampled ${sampled}`);
-    }
+    // The summary carries the age alone; the status pill already names the state.
+    if (activity) setText(activity, formatAge(session.lastActivityAtMs) ?? "no recorded activity");
+    if (sampled) setText(sampled, `sampled ${formatClock(session.lastSampledAtMs)}`);
     if (tokens) {
       const formatted = formatTokens(session.tokensUsed);
       setText(tokens, formatted ? `${formatted} tokens (persisted)` : "tokens unavailable");
@@ -612,6 +727,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
 
   const load = async () => {
     if (!active || !isSuperAdmin()) return;
+    void loadProviders();
     if (controller) controller.abort();
     const request = new AbortController();
     controller = request;

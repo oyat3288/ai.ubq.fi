@@ -3,8 +3,13 @@ import assert from "node:assert/strict";
 import adminHtml from "../static/admin.html" with { type: "text" };
 import adminScript from "../static/admin.js" with { type: "text" };
 import modelsScript from "../static/models.js" with { type: "text" };
-import adminSource from "../src/admin.ts" with { type: "text" };
-import { handleAdminCodexModelsWhitelistGet, handleAdminCodexModelsWhitelistSet, handleAdminModelsCatalogGet, handleAdminModelsRefresh } from "../src/admin.ts";
+import adminCodexSource from "../src/admin/codex.ts" with { type: "text" };
+import {
+  handleAdminCodexModelsWhitelistGet,
+  handleAdminCodexModelsWhitelistSet,
+  handleAdminModelsCatalogGet,
+  handleAdminModelsRefresh,
+} from "../src/admin/index.ts";
 import {
   CODEX_MODELS_WHITELIST_KV_KEY,
   filterWhitelistedCatalogModels,
@@ -12,13 +17,19 @@ import {
   filterWhitelistedModelMap,
   normalizeWhitelistModelIds,
   type CodexModelsWhitelist,
-} from "../src/codex_models_whitelist.ts";
-import handler from "../src/handler.ts";
-import handlerSource from "../src/handler.ts" with { type: "text" };
-import type { OpenRouterModelsSnapshot } from "../src/openrouter_models.ts";
+} from "../src/models/codex-models-whitelist.ts";
+import handler from "../src/handler/index.ts";
+import handlerSource from "../src/handler/index.ts" with { type: "text" };
+import { resetOpenRouterModelsCacheForTest, type OpenRouterModelsSnapshot } from "../src/models/openrouter-models.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { buildModelCatalogSnapshot } from "../src/openai.ts";
-import openaiSource from "../src/openai.ts" with { type: "text" };
+import { buildModelCatalogSnapshot, handleModels, handlePublicModelCatalog } from "../src/models/catalog.ts";
+import openaiSource from "../src/models/catalog.ts" with { type: "text" };
+import { CODEX_MODELS_KV_KEY, loadFullCodexModelsSnapshot } from "../src/codex/index.ts";
+import { buildRuntimeConfig, resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
+import { loadProviderSelection, PROVIDER_SELECTION_KV_KEY, resetProviderSelectionCacheForTest } from "../src/provider/selection.ts";
+import { CODEX_CATALOG_AUTH_GENERATION_KEY } from "../src/catalog/types.ts";
+import { resetMeteredModelsCacheForTest, setMeteredModelsFetchForTest } from "../src/provider/metered.ts";
+import { resetSurplusModelsCacheForTest } from "../src/provider/surplus.ts";
 
 // The catalog builder reads discovery credentials from the environment. Clearing
 // them keeps these tests on the credential-gated providers they own, and keeps
@@ -53,6 +64,19 @@ class WhitelistKv {
   }
 }
 
+/** Reject selected reads asynchronously, leaving the independent runtime/control keys readable. */
+class RejectingReadKv extends WhitelistKv {
+  readonly rejectedKeys = new Set<string>();
+  readonly reads: { key: string; consistency?: "strong" | "eventual" }[] = [];
+
+  override get<T>(key: Deno.KvKey, options?: { consistency?: "strong" | "eventual" }): Promise<Deno.KvEntryMaybe<T>> {
+    const encodedKey = keyOf(key);
+    this.reads.push({ key: encodedKey, consistency: options?.consistency });
+    if (this.rejectedKeys.has(encodedKey)) return Promise.reject(new Error("fixture KV read unavailable"));
+    return super.get<T>(key, options);
+  }
+}
+
 const catalogFixture = () => ({
   models: [
     { id: "gpt-5.6-sol", providers: [{ id: "codex" as const, owned_by: "openai", supported_endpoints: ["/v1/responses"] }], created: 1_800_000_000 },
@@ -72,6 +96,9 @@ const catalogFixture = () => ({
     surplus: { status: "available" as const, count: 1, updated_at_ms: 2 },
     deepseek: { status: "available" as const, count: 1, updated_at_ms: null, configured: true },
     cerebras: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
+    // The catalog source id union gained the LithosAI provider; this fixture is
+    // typed as a whole snapshot, so it must name every source id.
+    lithos: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
     openrouter: { status: "unavailable" as const, count: 0, updated_at_ms: null },
   },
 });
@@ -189,7 +216,13 @@ Deno.test("Cerebras claims its id unless the Codex snapshot already owns it", as
       ["cerebras"]
     );
     assert.deepEqual(row.providers[0].supported_endpoints, ["/v1/chat/completions"]);
-    assert.deepEqual(catalog.sources.cerebras, { status: "available", count: 1, updated_at_ms: null, configured: true });
+    const qwenRow = catalog.models.find((model) => model.id === "qwen-3.8-27b");
+    assert.ok(qwenRow, "the second configured Cerebras model is cataloged");
+    assert.deepEqual(
+      qwenRow.providers.map((provider) => provider.id),
+      ["cerebras"]
+    );
+    assert.deepEqual(catalog.sources.cerebras, { status: "available", count: 2, updated_at_ms: null, configured: true });
   } finally {
     Deno.env.delete("CEREBRAS_API_KEY");
   }
@@ -204,6 +237,192 @@ Deno.test("the model picker refuses to render without KV", async () => {
     const body = await response.json();
     assert.equal(body.error.type, "server_error");
   });
+});
+
+Deno.test("catalog builder and public/admin handlers retain runtime ids and tiers when the optional full snapshot rejects", async () => {
+  const kv = new RejectingReadKv();
+  kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+  const runtime = buildRuntimeConfig({
+    source: "runtime-fallback-fixture",
+    updated_at_ms: 1_800_000_000_000,
+    models: [
+      { slug: "runtime-fallback", supported_reasoning_levels: ["low", "ultra"], default_reasoning_level: "ultra" },
+      { slug: "runtime-hidden", supported_reasoning_levels: ["none"], default_reasoning_level: "none" },
+    ],
+  });
+  kv.values.set(keyOf(RUNTIME_CONFIG_V2_KEY), runtime);
+  kv.values.set(keyOf(CODEX_MODELS_WHITELIST_KV_KEY), { model_ids: ["runtime-fallback"], updated_at_ms: 1_800_000_000_001 });
+  kv.values.set(keyOf(PROVIDER_SELECTION_KV_KEY), { provider_ids: ["codex"], updated_at_ms: 1_800_000_000_002 });
+  resetRuntimeConfigCacheForTest();
+  resetProviderSelectionCacheForTest();
+  try {
+    await withKv(kv, async () => {
+      const catalog = await buildModelCatalogSnapshot();
+      const codexRows = catalog.models.filter((model) => model.providers.some((provider) => provider.id === "codex"));
+      assert.deepEqual(
+        codexRows.map((model) => model.id),
+        ["runtime-fallback", "runtime-hidden"]
+      );
+      assert.deepEqual(codexRows[0].supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(codexRows[0].default_reasoning_effort, "ultra");
+      assert.deepEqual(catalog.sources.codex, { status: "available", count: 2, updated_at_ms: runtime.codex_models.updated_at_ms });
+
+      const publicResponse = await handlePublicModelCatalog();
+      assert.equal(publicResponse.status, 200);
+      const publicBody = await publicResponse.json();
+      assert.equal(publicBody.object, "uos.model_catalog");
+      assert.deepEqual(
+        publicBody.data.map((model: { id: string }) => model.id),
+        ["runtime-fallback"]
+      );
+      assert.deepEqual(publicBody.data[0].supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(publicBody.data[0].default_reasoning_effort, "ultra");
+
+      const adminResponse = await handleAdminModelsCatalogGet();
+      assert.equal(adminResponse.status, 200);
+      const adminBody = await adminResponse.json();
+      assert.deepEqual(
+        adminBody.data.models
+          .filter((model: { providers: { id: string }[] }) => model.providers.some((provider) => provider.id === "codex"))
+          .map((model: { id: string }) => model.id),
+        ["runtime-fallback", "runtime-hidden"]
+      );
+      const adminRow = adminBody.data.models.find((model: { id: string }) => model.id === "runtime-fallback");
+      assert.deepEqual(adminRow.supported_reasoning_levels, ["low", "ultra"]);
+      assert.equal(adminRow.default_reasoning_effort, "ultra");
+      assert.deepEqual(adminBody.data.whitelist.model_ids, ["runtime-fallback"]);
+      assert.equal(adminBody.data.filter_active, true);
+      assert.equal(kv.reads.filter((read) => read.key === keyOf(CODEX_MODELS_KV_KEY) && read.consistency === "strong").length, 3);
+      assert.ok(kv.reads.some((read) => read.key === keyOf(RUNTIME_CONFIG_V2_KEY) && read.consistency === "strong"));
+    });
+  } finally {
+    resetRuntimeConfigCacheForTest();
+    resetProviderSelectionCacheForTest();
+  }
+});
+
+Deno.test("optional snapshot failure containment preserves snapshot shape checks and critical control read failures", async () => {
+  const kv = new RejectingReadKv();
+  const validSnapshot = { models: [{ slug: "valid-model" }], source: "fixture", updated_at_ms: 1 };
+  await withKv(kv, async () => {
+    kv.values.set(keyOf(CODEX_MODELS_KV_KEY), validSnapshot);
+    assert.deepEqual(await loadFullCodexModelsSnapshot(), validSnapshot);
+    for (const invalidSnapshot of [
+      { ...validSnapshot, models: [] },
+      { ...validSnapshot, models: [null] },
+      { ...validSnapshot, source: " " },
+      { ...validSnapshot, updated_at_ms: 0 },
+      { ...validSnapshot, updated_at_ms: 1.5 },
+    ]) {
+      kv.values.set(keyOf(CODEX_MODELS_KV_KEY), invalidSnapshot);
+      assert.equal(await loadFullCodexModelsSnapshot(), null);
+    }
+    kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+    kv.rejectedKeys.add(keyOf(CODEX_MODELS_WHITELIST_KV_KEY));
+    kv.rejectedKeys.add(keyOf(PROVIDER_SELECTION_KV_KEY));
+    assert.equal(await loadFullCodexModelsSnapshot(), null);
+    await assert.rejects(() => handleAdminModelsCatalogGet(), /fixture KV read unavailable/);
+    await assert.rejects(() => loadProviderSelection(kv as unknown as Deno.Kv), /fixture KV read unavailable/);
+    const unauthenticated = await handler(new Request("https://ai.ubq.fi/admin/models/catalog"));
+    assert.equal(unauthenticated.status, 401);
+  });
+});
+
+Deno.test("versioned rich paid catalog survives rejected optional snapshots without invented enrichment or relaxed controls", async () => {
+  const kv = new RejectingReadKv();
+  // A cold, unreadable catalog generation takes the real paid recovery branch.
+  kv.rejectedKeys.add(keyOf(CODEX_CATALOG_AUTH_GENERATION_KEY));
+  kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+  kv.values.set(keyOf(PROVIDER_SELECTION_KV_KEY), { provider_ids: ["openlux"], updated_at_ms: 1_800_000_000_000 });
+  kv.values.set(keyOf(CODEX_MODELS_WHITELIST_KV_KEY), { model_ids: ["paid-fallback-fixture"], updated_at_ms: 1_800_000_000_001 });
+  const originalFetch = globalThis.fetch;
+  const originalMeteredKey = Deno.env.get("METERED_API_KEY");
+  const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
+  let paidFetches = 0;
+  let unexpectedFetches = 0;
+  Deno.env.set("METERED_API_KEY", "fixture-paid-catalog-key");
+  Deno.env.set("SURPLUS_API_KEY", "fixture-disabled-surplus-key");
+  resetMeteredModelsCacheForTest();
+  resetSurplusModelsCacheForTest();
+  resetOpenRouterModelsCacheForTest();
+  resetProviderSelectionCacheForTest();
+  setMeteredModelsFetchForTest((input) => {
+    assert.equal(input instanceof Request ? input.url : input.toString(), "https://api.openlux.ai/v1/models");
+    paidFetches += 1;
+    return Promise.resolve(
+      Response.json({
+        data: [
+          { id: "paid-fallback-fixture", description: "Synthetic paid discovery", owned_by: "fixture", supported_endpoint_types: ["openai-response"] },
+          { id: "paid-not-whitelisted", owned_by: "fixture", supported_endpoint_types: ["openai-response"] },
+          { id: "paid-chat-only", owned_by: "fixture", supported_endpoint_types: ["openai"] },
+        ],
+      })
+    );
+  });
+  globalThis.fetch = () => {
+    unexpectedFetches += 1;
+    return Promise.reject(new Error("unexpected provider fetch"));
+  };
+  const request = () => new Request("https://ai.ubq.fi/v1/models?client_version=0.203.0");
+  try {
+    await withKv(kv, async () => {
+      // Preserve the original rejected strong-read trigger independently of the handler's recovery.
+      await assert.rejects(() => kv.get(CODEX_MODELS_KV_KEY, { consistency: "strong" }), /fixture KV read unavailable/);
+      for (const rejected of [true, false]) {
+        if (!rejected) {
+          kv.rejectedKeys.delete(keyOf(CODEX_MODELS_KV_KEY));
+          kv.values.set(keyOf(CODEX_MODELS_KV_KEY), {
+            source: " ",
+            updated_at_ms: 1_800_000_000_000,
+            models: [{ slug: "paid-fallback-fixture", context_window: 999_999, supported_reasoning_levels: ["high"] }],
+          });
+        }
+        const response = await handleModels(request());
+        assert.equal(response.status, 200);
+        assert.equal(response.headers.get("x-uos-upstream"), "metered");
+        assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+        const body = await response.json();
+        assert.equal(body.data, undefined, "the versioned response stays a rich Codex catalog");
+        assert.deepEqual(
+          body.models.map((model: { slug: string }) => model.slug),
+          ["paid-fallback-fixture"]
+        );
+        const row = body.models[0];
+        assert.equal(row.description, "Synthetic paid discovery");
+        assert.deepEqual(row.supported_endpoint_types, ["openai-response"]);
+        assert.deepEqual(row.supported_reasoning_levels, [{ effort: "none", description: "No reasoning" }]);
+        assert.equal(row.default_reasoning_level, "none");
+        assert.equal(row.context_window, undefined);
+        assert.equal(row.max_context_window, undefined);
+        assert.equal(row.auto_compact_token_limit, undefined);
+        assert.equal(row.visibility, "list");
+        assert.equal(row.supported_in_api, true);
+      }
+      assert.equal(paidFetches, 2);
+      const readsBeforeInvalidVersion = kv.reads.length;
+      const invalidVersion = await handleModels(new Request("https://ai.ubq.fi/v1/models?client_version=invalid"));
+      assert.equal(invalidVersion.status, 400);
+      assert.equal((await invalidVersion.json()).error.code, "invalid_client_version");
+      assert.equal(kv.reads.length, readsBeforeInvalidVersion);
+      assert.equal(paidFetches, 2);
+      kv.rejectedKeys.add(keyOf(CODEX_MODELS_KV_KEY));
+      kv.rejectedKeys.add(keyOf(CODEX_MODELS_WHITELIST_KV_KEY));
+      await assert.rejects(() => handleModels(request()), /fixture KV read unavailable/);
+      assert.equal(unexpectedFetches, 0, "disabled Surplus and other providers make no requests");
+      assert.ok(kv.reads.filter((read) => read.key === keyOf(CODEX_MODELS_KV_KEY)).every((read) => read.consistency === "strong"));
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    setMeteredModelsFetchForTest(null);
+    resetMeteredModelsCacheForTest();
+    resetSurplusModelsCacheForTest();
+    resetOpenRouterModelsCacheForTest();
+    resetProviderSelectionCacheForTest();
+    if (originalMeteredKey === undefined) Deno.env.delete("METERED_API_KEY");
+    else Deno.env.set("METERED_API_KEY", originalMeteredKey);
+    if (originalSurplusKey === undefined) Deno.env.delete("SURPLUS_API_KEY");
+    else Deno.env.set("SURPLUS_API_KEY", originalSurplusKey);
+  }
 });
 
 Deno.test("saving a selection trims, de-duplicates, and preserves the operator's order", async () => {
@@ -298,14 +517,17 @@ Deno.test("the model picker route is registered and stays behind admin auth", as
 
 Deno.test("the public and admin catalogs are built by one shared unfiltered snapshot", () => {
   // Drift guard: the admin picker must list models the whitelist hides, and the
-  // public catalog must still apply the whitelist to the very same snapshot.
+  // public catalog must apply the whitelist to the very same snapshot with no
+  // row, OpenRouter's dynamic entries included, bypassing it afterwards.
   const publicHandler = /export const handlePublicModelCatalog = async \(\): Promise<Response> => \{([\s\S]*?)\n\};/.exec(openaiSource)?.[1] ?? "";
   assert.notEqual(publicHandler, "", "handlePublicModelCatalog must stay declared");
   assert.match(publicHandler, /const \[catalog, selection\] = await Promise\.all\(\[buildModelCatalogSnapshot\(\), loadProviderSelectionCached\(\)\]\);/);
-  assert.match(publicHandler, /filterWhitelistedModelMap\(filterCatalogEntriesByProviderSelection\(catalog\.models, selection\), catalogWhitelist\)/);
+  assert.match(publicHandler, /const selected = filterCatalogEntriesByProviderSelection\(catalog\.models, selection\);/);
+  assert.match(publicHandler, /filterWhitelistedModelMap\(\s*selected,\s*catalogWhitelist\s*\)/s);
+  assert.doesNotMatch(publicHandler, /openRouterEntries|openRouterIds/, "no public row may skip the operator whitelist");
   assert.match(publicHandler, /sources: selectedCatalogSources\(catalog\.sources, selection\)/);
 
-  const adminHandler = /export const handleAdminModelsCatalogGet = async \(([\s\S]*?)\n\};/.exec(adminSource)?.[1] ?? "";
+  const adminHandler = /export const handleAdminModelsCatalogGet = async \(([\s\S]*?)\n\};/.exec(adminCodexSource)?.[1] ?? "";
   assert.notEqual(adminHandler, "", "handleAdminModelsCatalogGet must stay declared");
   assert.match(adminHandler, /const buildCatalog = dependencies\.buildCatalog \?\? buildModelCatalogSnapshot;/);
   assert.match(adminHandler, /models: catalog\.models/);
@@ -336,12 +558,14 @@ Deno.test("the Models tab renders checkbox tools instead of a free-text whitelis
     assert.match(adminHtml, new RegExp(`id="${id}"`), `${id} must be rendered`);
     assert.match(adminScript, new RegExp(`mustGet\\("${id}"\\)`), `${id} must be wired`);
   }
-  for (const provider of ["all", "codex", "openlux", "surplus", "deepseek", "cerebras"]) {
-    assert.match(adminHtml, new RegExp(`data-model-provider="${provider}"`), `${provider} needs a filter chip`);
-  }
-  for (const provider of ["codex", "openlux", "surplus", "deepseek", "cerebras"]) {
-    assert.match(adminScript, new RegExp(`\\b${provider}: "`), `${provider} needs a display label`);
-  }
+  // The chips are rendered from the roster the API returns, so the markup holds
+  // the container only and the panel keeps no provider list of its own.
+  assert.match(adminHtml, /<div data-model-filters role="group" aria-label="Filter by provider"><\/div>/);
+  assert.doesNotMatch(adminHtml, /data-model-provider=/);
+  assert.doesNotMatch(adminScript, /MODEL_PROVIDER_(LABELS|IDS)/);
+  assert.match(adminScript, /const renderModelProviderFilters = \(\) => \{/);
+  assert.match(adminScript, /modelsProviderFilters\.addEventListener\("click"/);
+  assert.match(adminScript, /providerLabelFor\(provider\.id\)/);
 
   assert.match(adminScript, /checkbox\.type = "checkbox"/);
   assert.match(adminScript, /dataset\.modelToggle/);
@@ -399,12 +623,14 @@ Deno.test("the Providers tab renders a provider picker next to the Analytics tab
     assert.match(adminHtml, new RegExp(`id="${id}"`), `${id} must be rendered`);
     assert.match(adminScript, new RegExp(`mustGet\\("${id}"\\)`), `${id} must be wired`);
   }
-  for (const tier of ["all", "subscription", "paid", "direct"]) {
-    assert.match(adminHtml, new RegExp(`data-provider-tier="${tier}"`), `${tier} needs a filter chip`);
-  }
-  for (const provider of ["codex", "openlux", "surplus", "deepseek", "cerebras"]) {
-    assert.match(adminScript, new RegExp(`id: "${provider}"`), `${provider} needs a roster entry`);
-  }
+  // Tier chips and provider rows come from the payload: the panel adds no tier
+  // or provider of its own, and health is read through the row's health key.
+  assert.match(adminHtml, /<div data-provider-filters role="group" aria-label="Filter by tier"><\/div>/);
+  assert.doesNotMatch(adminHtml, /data-provider-tier=/);
+  assert.doesNotMatch(adminScript, /PROVIDER_(ROSTER|TIER_IDS|TIER_LABELS|HEALTH_KEYS|ALL_IDS)/);
+  assert.match(adminScript, /const renderProviderTierFilters = \(\) => \{/);
+  assert.match(adminScript, /providersTierFilters\.addEventListener\("click"/);
+  assert.match(adminScript, /providerHealthFor\(entry\)/);
 
   assert.match(adminScript, /fetch\(apiUrl\("\/admin\/providers\/selection"\), \{/);
   assert.match(adminScript, /method: "POST"/);

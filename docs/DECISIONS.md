@@ -6,6 +6,504 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## The Mac gateway uses a checksum-pinned managed Deno 2.9.5 - 2026-10-03
+
+Only the Mac gateway launcher uses the official aarch64 Deno 2.9.5 artifact in
+`.data/runtimes/deno/2.9.5-b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa/deno`. Released Deno 2.9.6
+and 2.9.7 split read/write permission lists without decoding doubled commas, which breaks literal comma paths in
+`CODEX_HOME`; 2.9.5 retains that decoder. This is a service-specific compatibility rollback, not a global downgrade, and
+omits the later releases' fixes. CI remains pinned to 2.9.5. The released-source comparison is retained in the issue
+#812 runtime prerequisite record, with exact commits `17fadf33a8df3af9488b9f42efd1f2290d6dc7a3` (2.9.5) and
+`0c071246a412575e07423263404a5d13e7ed6aa2` (2.9.7).
+
+The fixed official archive SHA-256 is `b796aadd131f6930560c1ee040cf0d6f53933fbb987464e9ff46bd7ea4830615`; the extracted
+binary SHA-256 is `b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa`. Deployment prepares and verifies
+this immutable path under the existing deployment lock before release selection or service interruption, refuses corrupt
+or symlink destinations, and publishes only completed verified bytes. The launcher checks the binary again, uses it for
+both the dotenv-loading task and frozen application, selects the physical release's configuration, preserves literal
+native-home permissions and limits native writes to `app-server-control`. The application denies writes to
+`.data/runtimes`; missing or corrupt runtime state fails closed without falling back to the global binary.
+
+Existing synthetic proof: runtime preparation and actual disposable deploy ordering passed 14 tests in receipt
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/4fa44cf3-59d5-4fa1-9b5b-dadc5685e414`; the actual
+managed launcher passed all 11 native-home, configuration/lock, write-denial, failure and shutdown cases in
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/6ac18d06-c49d-438e-a398-b22be79ddd65`. A disposable
+native KV roundtrip seeded with 2.9.7, updated with 2.9.5 and reread with 2.9.7 preserved exact values and rejected
+stale CAS, with every child and KV handle settled; its result is
+`.codex-worktrees/plan-issue-812-abcb41d3034/.data/issue-812/kv-compatibility/roundtrip-result.json`. These proofs cover
+synthetic state, not the live gateway database or service.
+
+The normal test task adds three separate scoped Mac fixtures, retaining all existing suite segments and permissions. The
+launcher matrix must execute 2.9.5, including on Linux: only its disposable runtime coordinates and checksum comparison
+are substituted, and comma, symlink, absent-directory and runtime-write-denial cases remain required. Running that
+matrix with 2.9.7 must report the unsupported runtime rather than skip assertions. The existing `verify.sh` task call
+and CI test call include these fixtures without duplicate invocations or new tasks.
+
+Status: source and focused synthetic evidence accepted for integration; committed combined verification and
+whole-gateway synthetic acceptance remain required. Preparing the runtime in the canonical store or adopting it through
+live `deploy:mac`/launchd requires the separately approved concrete rollout. This decision authorizes no global binary
+or PATH change, other service downgrade, real credential mutation, live database probe, automatic upgrade, runtime
+fallback or runtime-store pruning. Reversal risk: restoring the global 2.9.6/7 launcher breaks escaped native-home
+paths; removing integrity checks or the runtime write denial lets the service use or alter an unverified executable.
+
+## Codex collaboration tools work over the Chat-only routes - 2026-10-03
+
+Codex clients expose the multi-agent tools (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`,
+`interrupt_agent`, `list_agents`) as a single `namespace` tool named `collaboration`, and resolve a returned call by its
+`(namespace, name)` pair. The Chat-only projection behind the DeepSeek, LithosAI, and Cerebras routes flattened
+namespace groups into bare Chat function names and returned only a name, so every call for a namespaced tool reached the
+client unqualified and failed as `unsupported call: spawn_agent` even though the tool had been delivered to the model.
+Three changes to that one adapter fixed the loop, all deployed as Mac release `92493574`:
+
+1. `ee641318` stores `{name, namespace}` for every namespace-grouped function, not only for renamed collisions, and both
+   response emitters write `namespace` on `function_call` items.
+2. `963f44d9` projects an `agent_message` input item (author, recipient, content) onto a user turn that names both
+   endpoints. Before this the projection rejected every input type other than `message`, so a parent turn failed with
+   `input item type 'agent_message' is not supported` as soon as a sub-agent answered.
+3. `92493574` forwards an unsealed `encrypted_content` agent-message payload verbatim and marks a Fernet-shaped payload
+   (`gAAAAA` prefix, at least 100 characters) as omitted. On these routes the client moves the payload text into that
+   field in the clear, so dropping it left every sub-agent with an empty task and its own "payload arrived
+   encrypted/unreadable" report.
+
+Evidence on 2026-10-03, against the local Mac service: `spawn_agent` returns `{"task_name":"/root/<name>"}` from a
+deepseek parent for both a deepseek child and a `qwen-3.8-27b` child; a deepseek worker received its task, wrote its
+handoff file, and the parent read `pong` back from disk; separately a parent received a worker's mailbox reply `pong`
+without any file handoff. Measured overhead: 884 ms from tool call to spawn result and 192 ms more until the child's
+first turn.
+
+Limits recorded with the same evidence: a sealed payload from a ChatGPT-backed thread stays opaque to this gateway
+because the opening key lives in that backend and the client implements no such crypto, so it is declared rather than
+invented; a sub-agent receives no collaboration tools in this client build, so fan-out depth is 1; `qwen-3.8-27b`
+rejects `reasoning_effort: max` (none/low/medium/high only) and its Cerebras quota can be exhausted, so an orchestrator
+should retry a rate-limited child with a deepseek model; and a child is aborted when its parent session exits, so the
+parent must wait for it.
+
+To re-verify the loop, run a headless session on the orchestrator model that spawns a child, waits for it, and prints
+what it received; the client-side knobs that matter are `[agents] default_subagent_model` and
+`default_subagent_reasoning_effort` in `~/.codex/config.toml`, where a `max` default serves deepseek children and is
+rejected by `qwen-3.8-27b`. The Mac service deploys from a clean canonical checkout with `deno task deploy:mac`, which
+snapshots HEAD into `.data/releases/<sha>` and restarts the launch agent; client builds are never patched.
+
+Reason: the owner asked for deepseek orchestrators that spawn deepseek and Qwen workers through this gateway, after
+`spawn_agent` failed with `unsupported call: spawn_agent` on every attempt.
+
+Reversal risk: reverting any one change restores its exact failure (`unsupported call: spawn_agent`, `agent_message`
+request rejection, or empty child tasks). If a future client seals payloads locally the `gAAAAA` heuristic would forward
+ciphertext as text until the marker is updated.
+
+## Analytics drops the Quota forecast card and the Metered capacity panels - 2026-10-03
+
+The admin Analytics view no longer renders the "Quota forecast" (quota runway) card, and the Provider analytics card
+renders only the two Codex pool accounts: the "Metered 2 refill" chart series and legend entry, the "Metered 2" and
+"Metered 1" (surplus) capacity rows, the metered staleness caption note, and the client-side quota-projection fetch,
+snapshot-cache restore, visible-poll refresh, and app-resume refresh are removed. The quota-projection HTTP endpoints
+and `src/quota-projection.ts` remain for operator and backfill use, and the Metered wallet/paid-fallback surfaces in the
+Defaults and Providers views are unchanged. This supersedes the 2026-10-02 "Admin Analytics quota panels refresh on a
+visible poll and on app resume" decision only where it named the quota runway panel; provider health and provider
+capacity keep the 30-second visible poll and the resume refresh.
+
+Reason: the owner reported that the quota forecast and Metered 1/2 "never showed any useful info" and asked for their
+removal from Analytics (2026-10-03).
+
+Reversal risk: restoring the card re-adds the fetch, cache restore, and resume hook; the removed refill series was
+Analytics' only rendering of the Metered wallet refill cycle, so metered wallet state is now observable only in the
+Defaults metered-quota panel.
+
+## Normal capacity reads revalidate Codex quota on a 30-second freshness window - 2026-10-02
+
+`GET /admin/providers/capacity` serves the persisted snapshot only while it is younger than
+`PROVIDER_CAPACITY_READ_FRESH_MS` (30 s, matching the Analytics visible poll) and otherwise awaits the existing
+lease-guarded `refreshProviderCapacity()` probe before responding. Concurrent stale reads coalesce through the same
+lease and its bounded cold wait, so one refresh serves them all and no request stacks a duplicate upstream call.
+`?refresh=live` keeps its documented force-probe semantics. Durable history keeps its fifteen-minute bucket:
+`PROVIDER_CAPACITY_HISTORY_BUCKET_MS` is unchanged and a same-bucket refresh overwrites that bucket's point rather than
+adding one. A refresh that throws keeps the last known persisted snapshot; a refresh that reaches upstream but fails
+leaves the affected source unavailable instead of reporting a fabricated percentage.
+
+Reason: the default read was persisted-only, so the Analytics quota cards could show a fifteen-minute-bucket-old Codex
+percentage, or an unbounded older one on a quiet gateway, while the client already polled every 30 seconds. The
+displayed value therefore did not change even though the poll and render path were correct.
+
+Reversal risk: restoring the persisted-only default read brings back the stale display; shortening the window below the
+poll cadence only repeats upstream probes, and making the read await an unbounded probe would reintroduce the latency
+the persisted-only boundary avoided. The probe itself stays read-only: usage reads with existing credentials, no OAuth
+refresh, inference, account, provider-selection, or quota-accounting change.
+
+## The Mac gateway delegates a shared CLI credential lineage to native Codex - 2026-10-02
+
+Only exact account and credential equality binds the local CLI file account to a durable `native_owner` in its KV pool
+entry. The gateway then requests refresh from the existing native daemon, verifies its `initialize.codexHome` and
+ChatGPT identity, and adopts the same-account persisted generation with pool CAS; it never writes `auth.json` or
+performs its own OAuth for that owner. Uploaded sibling accounts retain their existing refresh path. Upload and repair
+cannot erase the binding or replace it with stale credentials.
+
+A changed generation requires a usable access token and nonregressing access expiry. When two native rotations share a
+JWT expiry, the native owner's persisted `last_refresh` orders them, including its submillisecond precision. This
+metadata never bootstraps ownership, and filesystem mtime never selects a credential source. Missing or mismatched
+files, daemon failures and inconclusive replies refuse gateway refresh with local owner errors; they do not establish
+current-credential invalidity or quota exhaustion.
+
+The observed CLI sessions share one native daemon, whose in-process semaphore serializes refreshes. Independent native
+processes have no cross-process mutex; guarded reload and reuse recovery remain necessary. This change preserves CLI
+sign-in and sync and does not repair an external stale sync writer or change VPS credentials, service permissions or
+configuration.
+
+Status: focused synthetic ownership, existing auth regressions and concurrent native CLI/gateway loopback acceptance
+passed. The native proof used strict HTTPS and a task-owned test CA; no real credentials were refreshed by this work.
+
+## `/v1/live` calls are bound to the authenticated gateway principal that created them - 2026-10-02
+
+Call creation resolves the authenticated principal (`resolveIdempotencyPrincipal`, e.g. `api-key:<key_id>`) and persists
+it alongside the account in the `codex_live_calls` v1 mapping; the sideband join must present the same principal. A join
+by a different valid principal, and a legacy mapping that records no principal at all, are both refused with 403 before
+the WebSocket upgrade, with no permissive compatibility fallback; a reconnect by the creating principal still upgrades
+and rejoins on the mapped upstream account. The mapping TTL is unchanged at one hour.
+
+Reason: `/v1/live` authenticated the request but bound the call only to the upstream account, so any valid gateway
+principal that learned a call id could attach to another principal's call and use the creator's upstream credentials.
+
+Status: implemented and locally tested (focused loopback HTTP/WebSocket regression and changed-file lint, receipts
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/58ac6b41-8949-40a6-9eff-46f2de4d9bcf` and
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/e08bfb68-25ca-48fd-ab60-3be8a56082aa`); not deployed.
+
+Reversal risk: dropping the principal comparison restores cross-principal sideband attachment and creator-credential
+use; treating an absent `principal_id` as authorized would reopen it for every mapping written before this change, and
+extending the TTL would lengthen that window.
+
+## Admin Analytics quota panels refresh on a visible poll and on app resume - 2026-10-02
+
+The admin console's Analytics quota panels (provider health, provider capacity, and the quota runway) keep the existing
+30-second visible poll, and `bindForegroundRefresh` now also refreshes them immediately when a resume is observed:
+window `focus`, `visibilitychange` to visible, or a bfcache `pageshow` (`event.persisted === true`; the first load's
+`pageshow` is ignored). The helper coalesces those events into one scheduled refresh and each loader returns early while
+its own request is in flight, so focusing a window, returning to the tab, and restoring from bfcache cannot stack
+duplicate requests or timers. The quota-projection request keeps its 30-day window and the capacity endpoint keeps
+serving the persisted snapshot, so this client lifecycle change adds no upstream polling: the metered quota snapshot
+still refreshes upstream only at its own `METERED_QUOTA_FRESH_MS` (5 minute) boundary.
+
+Reason: Analytics is the authenticated default view, but the foreground-refresh binding only refreshed the Defaults
+view, so an app resumed from background or bfcache kept showing a stale quota until the next visible poll tick, which
+mobile background timer suspension can delay indefinitely, or until a full reload.
+
+Reversal risk: removing the resume hook restores the stale-after-resume display; removing the `pageshow` initial-load
+guard refreshes on every ordinary page load; adding a second interval instead of reusing the existing poll duplicates
+requests.
+
+## Codex model availability follows the per-account pool - 2026-10-02
+
+The Codex-native catalog `GET /v1/models?client_version=X.Y.Z` and the normalized `["ubq_ai","codex_models"]` snapshot
+are built from the union of every pool account's own `/codex/models` answer: rows deduplicate by `slug` in pool order,
+the first-in-pool-order row is kept verbatim, and a single configured account keeps the previous single-account response
+including its conditional-request and 304 revalidation contract. Per-account catalog rows and learned account+model
+rejections live in `["uos_ai","codex_account_models","v1"]` as a non-secret routing hint; the operator whitelist filter
+stays downstream and unchanged, so it still narrows whatever the union advertises.
+
+A named model an account provably cannot serve — a learned rejection, or a stored catalog for the same client version
+that lacks a model a sibling's same-version catalog lists — is skipped in routing without touching quota fences,
+invalidating a credential, or opening an upstream-timeout circuit; unknown availability never skips. When the durable
+active account is skipped for that reason and an entitled sibling exists, the ordinary election advances once with the
+new transition reason `model_unavailable`, and when no account is entitled the gateway answers a graceful OpenAI-shaped
+404 `model_not_found` naming the model rather than 429 or 503.
+
+Upstream's `The '<model>' model is not supported when using Codex with a ChatGPT account.` 400 is the one learned
+eligibility signal: that account+model pair is recorded and the request makes exactly one bounded sibling attempt
+through the existing reselection machinery before falling back to the same graceful 404. Every other 400 passes through
+byte-for-byte with no retry and no new state. Single-active-account admission, quota and credential fencing, and
+paid-fallback authorization are otherwise unchanged.
+
+Reason: on 2026-10-02 the catalog refresh stored one account's answer, so `gpt-daybreak-blue-latest` — served only by
+pool account `54e77f76-...` — disappeared from both the versioned catalog and the normalized snapshot, and the gateway's
+own model validation rejected the client's request while its entitled account was healthy.
+
+Reversal risk: reverting to a single account's catalog hides per-account entitlements again; treating an ineligible
+account as quota-exhausted or credential-invalid writes fences, unlocks paid fallback, or wedges routing; learning from
+any 400 other than the exact upstream shape misattributes ordinary request errors and can skip a capable account.
+
+## Model-switch replay repairs gateway item ids and drops gateway-local reasoning - 2026-10-02
+
+The Chat-only Responses routes (DeepSeek, LithosAI, Cerebras) minted synthetic item ids as `${responseId}_<kind>_<n>`,
+but OpenAI validates replayed item ids by their type prefix (`rs`, `msg`, `fc`, `ctc`), so a Codex thread that had
+completed a DeepSeek turn failed every later `gpt-6.1-sol` turn with
+`Invalid 'input[n].id' ... Expected an ID that begins with 'fc'`; a replayed synthetic reasoning item also cannot be
+resolved under `store: false` (`Item with id ... not found`). The shared output builders now emit
+`<kind>_${responseId}_<n>` (the streamed custom tool call included, so it carries the same `ctc_` prefix the buffered
+builder uses), and `buildCodexRequest` is the Codex seam that repairs an already-stored history: a replayed reasoning
+item whose id matches either producer shape and carries no non-empty `encrypted_content` is dropped, every other
+recognized synthetic id (message, function call, custom tool call) loses only its `id` while keeping content, order and
+`call_id`, and genuine OpenAI ids, encrypted reasoning bytes, and the DeepSeek/LithosAI/Cerebras request bodies are
+untouched. The Responses assembler now forwards the builder's repaired `input` to the Codex upstream and hands the
+original input back to the removed-provider fallback, so only the Codex replay is repaired. Live probes: omitting one
+synthetic function-call id alone returned `response.completed` with `pong`, while an unencrypted reasoning item
+re-prefixed to `rs_` still answered 404.
+
+Reason: the upstream validator sees another provider's replayed history on a model switch, and a stateless
+(`store: false`) upstream can only resolve reasoning it can decrypt; both must be repaired at the one place that builds
+the Codex request.
+
+Reversal risk: widening the drop to every reasoning item without `encrypted_content` would discard items a `store: true`
+client can legitimately replay; matching ids by a loose `resp_` substring would rewrite genuine ids, so only the
+producer's exact `<kind>_...` shapes are recognized.
+
+## Public models use the enabled set for every provider - 2026-10-02
+
+Apply the operator whitelist to every `/uos/models/catalog` row, including OpenRouter.
+
+`/models` renders this feed. An empty or absent whitelist keeps the existing no-filter behavior.
+
+Admin discovery, `/v1/models`, and `/uos/models/capabilities` retain their existing contracts.
+
+Reason: disabled OpenRouter rows were appended after filtering and appeared on the public page.
+
+Reversal risk: bypassing the filter again makes disabled models visible.
+
+## The Codex-native catalog honors the operator whitelist for every assembled provider - 2026-10-02
+
+On 2026-10-02 the user's intent is that the enabled-model policy, the operator's model whitelist, controls what a Codex
+client can select. The Codex-native versioned contract `GET /v1/models?client_version=X.Y.Z` therefore filters every
+assembled row through that one authority, OpenRouter's dynamic rows included; neither the stored-catalog cache fast path
+nor the metered fallback may serve rows past a nonempty whitelist. An absent or empty whitelist remains no filter at
+all, so OpenRouter's rows still list on their own snapshot TTL without an operator re-save. Per-model metadata is
+preserved verbatim; only the advertised set is narrowed. The unversioned `GET /v1/models` and the provider-discovery
+surfaces (`/uos/models/catalog`, `/uos/models/capabilities`) keep their existing contracts unchanged, deliberately,
+because the reported bug is the Codex client picker and this entry expands no policy beyond it.
+
+Reason: the operator enabled 16 ids while Codex showed 477, because OpenRouter's rows were appended after the whitelist
+on every listing surface (commit `9531d8b8`, 2026-09-30) and the versioned catalog's cache fast path bypassed the filter
+entirely. The versioned catalog is the one Codex selects from, and it is the seam corrected for this report; the other
+surfaces were not part of the reported defect and are intentionally left as they are.
+
+Reversal risk: appending OpenRouter rows after the filter again restores hundreds of unenabled models in the Codex
+picker; treating an absent or empty whitelist as "nothing enabled" hides the dynamic catalogue without an operator
+selection; extending this gate to the unversioned or discovery surfaces is a separate decision this entry does not
+authorize.
+
+## `/v1/live` relays call creation to the ChatGPT backend and the sideband to api.openai.com - 2026-09-30
+
+The Codex client's realtime voice (TUI, v3/frameless) creates a WebRTC call with `POST <provider-base>/live` (multipart
+`sdp` + `session` parts) and joins the call's control socket at `wss://<ws-base>/v1/live/<call_id>`. The gateway serves
+both under `src/live/`: call creation is translated to the ChatGPT backend JSON shape at
+`${CODEX_BASE_URL}/realtime/calls?intent=quicksilver&architecture=avas` on one eligible Codex pool account, the returned
+`Location` is rewritten to `/v1/live/<call_id>`, and the creating account is mapped to that id (1 h TTL) so the sideband
+rejoins on the same credentials; the sideband then bridges text frames to `wss://api.openai.com/v1/live/<call_id>`. The
+two legs cannot share one upstream base: the ChatGPT backend rejects the multipart shape
+(`400 Unsupported content
+type`), and the API host refuses subscription-created calls
+(`403 Voice session access denied`) while accepting the sideband join with the same subscription token. SDP, ICE, and
+media are passed through untouched, so WebRTC media still flows between the client and OpenAI directly.
+
+Reason: live calls are metered on the ChatGPT backend route while the call's control socket lives on the API host; only
+the two-step relay keeps both legs on one account without terminating WebRTC in the gateway.
+
+Reversal risk: pointing creation at `api.openai.com/v1/live` restores the 403; dropping the call-id-to-account map makes
+sideband joins fail closed with 404; and a client without `experimental_realtime_ws_base_url` set to the gateway base
+joins `api.openai.com` directly with the gateway's own credential and fails, so that client-side setting is part of this
+deployment contract. `/v1/live` stays outside inference metering and admission, but its responses feed Codex provider
+health/capacity.
+
+## Sandboxed commits sign through a GNUPGHOME inside writable roots - 2026-09-29
+
+DSH's `workspace-write` file sandbox permits writes only under the workspace root, `/tmp`, and `os.tmpdir()`
+(`writableRoots` in `@deepseek-ai/dsh-sandbox`). GnuPG must write its homedir — `trustdb.gpg`, `random_seed`, and the
+`S.gpg-agent*` sockets — so a signed commit from a confined shell failed with
+`gpg: can't connect to the gpg-agent: Operation not permitted` while `GNUPGHOME` stayed at `~/.gnupg`. Committing
+therefore required a per-commit `danger-full-access` escalation.
+
+`~/bin/gpg-dsh` is installed and set as `gpg.program`. It uses the real homedir when that is genuinely writable and
+otherwise seeds a homedir under `$TMPDIR/dsh-gnupg/<uid>` from `~/.gnupg` (public keyring plus `private-keys-v1.d`),
+re-seeding when `pubring.kbx` changes. Interactive shells take the passthrough branch and are unaffected.
+`git config --global gpg.program ~/bin/gpg-dsh`.
+
+Reason: the sandbox exposes no configuration hook for adding writable roots — `writableRoots` takes only the policy and
+hard-codes the three roots — so the only durable fix inside the existing policy is to put the signing homedir where the
+sandbox already allows writes. Escalating every commit instead is not a fix, and `danger-full-access` grants far more
+than signing needs.
+
+Reversal risk: pointing `gpg.program` back at the real `gpg` restores the denial under `workspace-write`; copying the
+private key to a stable non-writable-root location such as `~/.local/share` looks persistent but is unwritable under the
+restricted policy and silently reintroduces the escalation. The fallback homedir is per-boot (`/var/folders`), which is
+intended: it is re-seeded from `~/.gnupg` on demand rather than becoming a second long-lived key store.
+
+## Forwarded payloads are bounded by a declared, versioned policy, and `truncation: "disabled"` fails closed - 2026-09-25
+
+The DeepSeek/Lithos translation counts every forwarded byte as text tokens. On 2026-09-24 a single 744,586-byte
+`view_image` tool result took one session from 736,213 to 1,250,713 requested tokens against the 1,048,576-token window;
+the provider rejected every later replay, including compaction, and the thread could not be resumed. The first repair
+cut each payload at an undeclared 64 KiB constant. That stopgap is replaced by `FORWARDED_PAYLOAD_POLICY`
+(`deepseek-forwarded-payload/v1`, one source of truth in `src/deepseek/forwarded-payload-policy.ts`): a versioned
+per-message byte limit, advertised to Codex clients as a `forwarding_policy` extension on the gateway-served catalog
+records, carried in the visible elision marker and the `forwarding_elision` operator log line, and enforced
+deterministically (byte prefix plus marker inside the declared limit).
+
+Behavior: an absent `truncation` field or `"auto"` keeps the bounded reduction, because the clients this route serves
+omit the field and cannot repair a rejected history; an explicit `truncation: "disabled"` fails closed with HTTP 400
+`context_length_exceeded` naming the item path, byte counts, and declared limit instead of mutating the input; any other
+value is rejected with `param: "truncation"`. This is a deliberate gateway policy, not an OpenAI guarantee: the
+documented default for an absent field would reject rather than reduce.
+
+Reversal risk: reverting to silent cutting restores unreported evidence loss; removing the bound restores the 2026-09-24
+poisoning; treating an absent field as `"disabled"` wedges Codex clients that cannot alter their history. Residual gap:
+aggregate admission (the whole rendered prompt against the model window minus the output reserve) is not implemented;
+this policy bounds one message, not the sum.
+
+## Coverage is measured per src line and branch, and no threshold is enforced yet - 2026-09-24
+
+The first real coverage measurement of `src/` came from running all three segments of `deno task test` with `--coverage`
+and merging them with `deno coverage .data/cov-main .data/cov-oss .data/cov-meas --include='^file://<repo>/src/'`: 83.4%
+lines and 82.8% branches at tip `125185c5c`, with `src/types.ts` the only source file absent because it is type-only and
+erased at runtime. Measuring one segment under-reports: `tests/oss-gateway-http.test.ts` runs under stripped
+`SURPLUS_API_KEY`/`METERED_API_KEY` with `--unstable-kv`, and `tests/usage-optimization-measurement.test.ts` runs with
+only `UOS_AI_TOKEN`/`DENO_DEPLOY_TOKEN`.
+
+The program target is 90% for both lines and branches, and it is now met: four coverage waves took `src/` from 83.4%
+lines and 82.8% branches at `125185c5c` to 92.15% lines and 90.10% branches, with `sh scripts/verify.sh` green and 2101
+tests passing. That work added 21 test files plus `tests/helpers/sentinel-kv-stub.ts`. No gate enforces the threshold
+yet; this entry records the measurement and its command so a later decision can add one without re-deriving either.
+`sentinel` went from 58.0% to 96.3% of its replay cluster by driving those modules with an in-memory KV stub, which is
+required because `Deno.openKv` is undefined in the default test task (no `--unstable-kv`): a KV-backed path is reachable
+in that suite only when the test passes a stub.
+
+What is still uncovered is recorded per file in the lane handbacks and falls into four kinds, none reachable by a test
+without changing production code or widening the test command's permissions: permission-denied environment reads for
+keys the allowlist excludes (`SENTINEL_REPLAY_KEY`, the deploy-runtime slugs) plus the deny-listed
+`.data/codex-supervisor.json` and `--allow-read` state-DB paths in `supervisor-inventory.ts`; branches unreachable by
+construction, such as the deflate ciphertext ceiling, validation re-checks of values the same function just validated,
+and `typeof x !== "string"` guards after `JSON.stringify`; timer-driven reservation machinery whose pending ops would
+leak across tests; and fixtures that need a concurrent writer or a real WebAuthn attestation.
+
+Two traps found while measuring. A process-wide `fetch` stub counts unrelated background traffic: the paid-fallback
+quota refreshes schedule their own requests on timers that outlive the test that armed them (`src/provider/metered.ts`,
+`src/provider/surplus.ts`), which intermittently failed `tests/codex-account-routing-part3.test.ts` with two dispatches
+inside a zero-dispatch window, so its counters now attribute dispatches by the test's own request body. Coverage is also
+not a review: the first wave needed manual repair of nine guessed expectations, for example a JSON byte length asserted
+as 20 where `{"model_ids":["gpt-5"]}` is 23 bytes, and `listKernelUsageLimits` projecting a malformed `acme/demo/extra`
+key onto a second `acme/demo` row because `kernelPolicyRow` reads only the first two key segments.
+
+## Filenames are kebab-case and enforced by ESLint, and `src/` is grouped by domain - 2026-09-24
+
+`check-file/filename-naming-convention` in `tools/lint/eslint.config.mjs` uses the built-in `KEBAB_CASE` naming
+convention with `{ ignoreMiddleExtensions: true }`, over `**/*.{js,ts}` at any depth. `ignoreMiddleExtensions` is
+required: without it the convention rejects the dot in `*.test.ts`, so every test file reported.
+
+The rule had been in this config since the ruleset was ported, but it did not enforce anything. Its naming pattern was
+the ts-template default `"+([-._a-z0-9])"`, a micromatch expression that admits `_` and `.`, so snake_case filenames
+satisfied it and the whole `src/` tree passed. That pattern was never intended as kebab-case enforcement: the canonical
+`ubiquity/ts-template` config carries the same string and uses camelCase filenames. Measured with the plugin's own
+`micromatch` dependency, `isMatch("admin_api_keys.ts", "+([-._a-z0-9])")` is `true`, so the file passed; the plugin
+strips the extension and tests the resulting basename against the `KEBAB_CASE` expression
+`+([a-z])*([a-z0-9])*(-+([a-z0-9]))`, which that basename does not match. Two further traps sat behind it:
+`eslint-plugin-check-file@3` bails out of the check when the glob key itself matches a predefined convention, and its
+`micromatch.capture` returns the _directory_ in capture group 0 for a nested path, so a nested file is validated against
+its parent directory name rather than its basename.
+
+The enforcement change is inseparable from the rename, because the rule is repo-wide and one unrenamed `*.ts` file fails
+the gate. `src/` is now grouped by domain - `admin/`, `auth/`, `cache/`, `catalog/`, `chat/`, `codex/`, `deepseek/`,
+`embeddings/`, `handler/`, `harmony/`, `kernel/`, `models/`, `paid-fallback/`, `provider/`, `sentinel/` - with genuinely
+shared singletons left at the `src/` root. `tests/` keeps one flat directory and is only kebab-renamed, so the
+`../src/...` depth in every test import is unchanged.
+
+Reversal risk: this config is also where three measured, file-scoped exemptions live, and each names its target by path.
+Renaming or moving a file silently orphans its exemption, and the gate then reports the suppressed rule as if the code
+had regressed - which is exactly what happened here to `sonarjs/function-return-type` on `src/models/codex-models.ts`
+(formerly `src/codex_models.ts`). When you move a file, grep this config for its path first. Widening the naming pattern
+back to a character-class expression would also silently stop enforcing the convention without failing anything, so
+prefer a predefined convention, or verify any custom pattern against a known-bad filename.
+
+## Oversized files are capped with a tightening-only baseline - 2026-09-23
+
+`scripts/file-size-ratchet.ts`, run by `sh scripts/verify.sh`, caps source files at 1000 lines and test files at 1500.
+The 31 files already above their caps are grandfathered by a recorded per-file ceiling in `file-size-baseline.json`,
+checked in at the repository root. Their ceilings were recorded with `--init` on 2026-09-23 at HEAD `411b3db04f`.
+
+The check fails whenever the tree and the baseline disagree: a file over its cap with no entry, a recorded file above
+its recorded ceiling, a recorded file that shrank below its recorded ceiling, a recorded file that fell back within its
+cap, or a recorded path with no file left. `deno task size:update` is the only writer; it lowers or drops ceilings and
+refuses to raise one or to record a file that is over its cap. That is stricter than the ESLint `max-lines` rule the
+flat config leaves off: a recorded ceiling tracks the file's real size, so shrinking a 14,296-line file to 12,000 must
+be committed with a 12,000 ceiling before the next change can grow past it. ESLint bulk suppressions are deliberately
+not used, because they count violations rather than lines and would let a file grow from 1,001 to 10,000 unchecked.
+
+Reversal risk: deleting an entry from the baseline re-authorizes unbounded growth for that file while a `verify` run
+would only start failing after the file passes the deleted ceiling, and disabling `size:update` in favor of hand edits
+removes the raise-refusal. The recorded ceilings are intentionally large numbers; do not read them as targets.
+
+## LithosAI advertises its full context window - 2026-09-23
+
+`LITHOS_EFFECTIVE_CONTEXT_WINDOW_PERCENT` in `src/provider/lithos.ts` is 100, not the 95 percent reserve the other
+providers keep: the direct LithosAI route advertises its full 1,048,576-token window to `/v1/models` and the Codex
+catalog instead of a padded one. The 95 percent value would publish an effective window 52,428 tokens smaller than the
+one the provider advertises, and nothing in the panel or the catalog would show that the difference is a local choice.
+Reversal risk: lowering it again silently shrinks every consumer's view of this route, so change it only with a
+measurement showing the upstream refuses the advertised size.
+
+## Immutable releases are pruned after a verified deploy: the newest five plus the running one - 2026-09-23
+
+Both deploy paths unpack a full `git archive` of the released revision into `.data/releases/<sha>`, so a repeatedly
+deployed checkout carried one complete copy of `src`, `tests`, `docs` and `static` per revision: 47 directories and 391
+MB on the Mac, roughly 12,000 duplicate TypeScript files that every recursive search and editor walk pays for. Retention
+is now enforced by the deploy itself rather than left to an operator. `ops/release_retention.ts` keeps the five newest
+releases by mtime plus whatever `.data/current` resolves to, and `ops/deploy-mac.ts` and `ops/deploy.ts` call it only
+after the health check proves the new release is live, so a pruning fault is reported in the JSON receipt
+(`releases_pruned`) instead of failing a verified deployment.
+
+Guardrails: only a directory whose name is a full 40-character Git revision is a candidate; a candidate is skipped when
+it resolves outside the store, so a planted symlink cannot redirect the delete; `.staging-*` directories and plain files
+are never touched; the running release survives even when it is the oldest directory present. `deno task prune:releases`
+applies the same policy by hand for a checkout that predates retention, and `deno task test:vps` carries the retention
+tests inside the verify gate.
+
+Retention is a policy constant (`RELEASE_RETENTION_KEEP = 5`), not a per-invocation flag: rollback only needs recent
+releases, and an operator-facing knob would be tuned ad hoc. The Mac was pruned once under the new policy (47
+releases/391 MB to 5 releases/47 MB) with `.data/current` and the live `git sha` health identity unchanged; the VPS
+prunes on its next `deno task deploy:vps`. The separate duplication in `.codex-worktrees` (about 90,000 TypeScript
+files, mostly `tools/node_modules` materialized per worktree by `scripts/_bootstrap.sh`) is acknowledged and remains
+unaddressed by this decision.
+
+## Capture storage is bounded per host with oldest-first eviction - 2026-09-22
+
+The owner authorized capturing private request contents and deleting the oldest capture-owned records when storage
+grows, around a 1 GiB per-host budget. Each host therefore keeps one fixed 1 GiB budget for capture-owned encoded KV
+payload (base64-expanded ciphertext chunks plus metadata/status/dedupe/index row overhead) plus in-flight charges, with
+a hard record-count bound. **Durable per-capture accounting rows are the source of truth** and the ledger is derived
+cached state: admission, publication, release, eviction, payload expiry and status admit/prune change a charge in the
+same `kv.atomic()` commit as its row, checking both exact versionstamps. Accounting rows are timestamp-first keyed (the
+oldest-first index), carry no KV TTL, and stop existing only through the atomic commit that deletes them and decrements
+the ledger. Bootstrap materializes each missing legacy accounting row together with its ledger charge; cleanup of a
+manifest that predates request ownership retains only its fingerprint tombstone rather than inventing an owner status.
+
+Admission reserves in durable KV before any chunk is written. A fence-advance commit precedes each batch, and one atomic
+chunk transaction checks its committed accounting-row versionstamp before writing at most twelve 48 KiB chunks (576 KiB
+payload plus bounded keys/check overhead, below the 800 KiB atomic limit). Revoke or release changes that row, so a
+paused transaction cannot append after capacity was reclaimed. Publish transitions `reserved -> stored` together with
+the manifest, dedupe, request status, incident evidence and ledger; a refused admission is skipped with a visible
+`storage_full` status instead of storing unaccounted data. Eviction claims a victim by CAS before deleting anything,
+releases the charge only once its chunk prefix is provably empty, and CAS-deletes the dedupe row only when it still
+references that victim's manifest key. TTL expiry is a separate reclamation path reporting `expired`/`payload_expired`
+with no `evicted_*` increment. Capture-owned status and tombstone rows are bounded by a fixed 64 MiB reserve inside the
+1 GiB (payload admissions may use at most `budget - 64 MiB`) and a 50,000-row bound, pruned oldest-first; a pruned
+lookup reports `status_not_retained`. Native metadata TTL deletion is not an atomic ledger update: maintenance and
+metadata pressure reconstruct those derived counters only after a complete bounded strong scan of both prefixes and a
+CAS on the ledger version captured before scanning. Concurrent accounted mutations invalidate the scan; TTL deletion
+during scanning can leave a conservative overcount until a later pass, without incrementing pruning history.
+Pre-existing captures are counted by a resumable bootstrap that sweeps every capture-owned prefix, counts scanned
+entries and fails closed on a corrupt in-scope row or an unreadable ledger, never assuming zero.
+
+The budget deliberately does not bound the shared SQLite database, its WAL, reusable allocated pages, other namespaces,
+the incident index namespace in `src/sentinel/incident-outbox.ts` (separate incident bookkeeping whose capture reference
+rows are TTL-bound to evidence expiry), or auth/quota/usage state, and eviction never touches them. Host text logs are
+separate: the Mac gateway's launchd `mac.stdout.log`/`mac.stderr.log` sizes are reported stat-only as `null` when
+unmeasured, with an independent 1 GiB warning, and no rotation or truncation is performed by this feature. The 32 MiB
+request and 4 MiB/4,096-chunk/8-attempt trace ceilings are unchanged; one derived limit module now feeds serialization,
+encryption, export/decode and the offline reader so the previous mismatched 256 KiB metadata cap and reader bound cannot
+disagree. The admin error-history panel shows usage, cap, eviction and skip notices from the existing capture-retention
+status.
+
+Reversal risk: reverting to unbounded growth, counting raw ciphertext instead of the encoded payload, publishing a
+manifest before its budget transition, letting an expired lease free budget while an unfenced writer can still append
+chunks, making the ledger authoritative instead of the rows, applying a ledger delta in a commit separate from its row
+change, releasing a charge before the chunk prefix is provably empty, evicting without a claim CAS, or letting
+capture-owned status metadata grow without bound would each restore silent unbounded growth, double-charge capacity or
+lose accounting.
+
 ## Gateway reliability program: finite admission, terminal parity, deadlines, optional analytics - 2026-09-22
 
 A finite process-resource guard now bounds terminal inference routes at 64 active requests and 128 waiting requests with
@@ -114,7 +612,7 @@ and the guard skipped the recheck for it.
 The semantic recheck described above is retired. The user's rule is explicit: invisible inference, or an inference leak,
 is never allowed. A gateway that repeats a caller's task with a hidden appended user prompt is a second generation the
 requesting client never asked for, cannot see, and cannot audit, so it is not a permitted mitigation regardless of its
-effect on premature stops. The implementation was removed from `src/openai.ts` and `src/deepseek_responses.ts`: no
+effect on premature stops. The implementation was removed from `src/openai.ts` and `src/deepseek/responses.ts`: no
 hidden recheck prompt, no second upstream dispatch, no folding of a second generation's tools into the first response,
 and no combined two-request usage accounting remain. After a successful text-only first response the gateway completes
 with that provider output, and the streamed and buffered single-dispatch regression checks assert exactly one upstream
@@ -472,7 +970,7 @@ underpowered to exclude a small effort effect.
 The terminal-truthfulness work changes what a truncated generation reports. Whether that is safe per provider was
 checked provider by provider rather than assumed from one implementation, because the mapping lives inside a route.
 
-**Only one construction site exists.** `response.incomplete` is built at exactly one place, `src/deepseek_responses.ts`
+**Only one construction site exists.** `response.incomplete` is built at exactly one place, `src/deepseek/responses.ts`
 (the DeepSeek translator), and is reachable only from `handleDeepSeekChatCompletions` and `handleDeepSeekResponses`. No
 other provider route can emit it. A per-provider allow/deny filter would therefore be solving a leak that does not
 exist; a provider that should use the mapping needs its own deliberate implementation.
@@ -486,8 +984,8 @@ exist; a provider that should use the mapping needs its own deliberate implement
 
 **The Cerebras path was reproduced, not inferred.** A direct probe with `max_completion_tokens: 16` returned
 `finish_reason: "length"` with the `content` key absent entirely and only `reasoning` populated (53 characters), on two
-consecutive runs. That trips `choiceHasNoPayload` (`src/cerebras.ts:376`, applied at `:403`), which rejects a choice
-carrying neither content, nor a tool call, nor a refusal. Through the gateway the same request returns HTTP 502
+consecutive runs. That trips `choiceHasNoPayload` (`src/provider/cerebras.ts:376`, applied at `:403`), which rejects a
+choice carrying neither content, nor a tool call, nor a refusal. Through the gateway the same request returns HTTP 502
 `cerebras_upstream_invalid_response`, recorded in the error ledger as
 `chat.completions 502 cerebras_upstream_invalid_response model=gpt-oss-120b`. Note that reasoning alone is deliberately
 not sufficient payload: it is preserved for clients as `message.reasoning`, but it is not content.
@@ -685,7 +1183,7 @@ the gateway accepted, and re-opens the gap on both seams.
 
 `gpt-reserve` is luna served under a second Codex model id the owner authorized on 2026-09-20 as a distinct model with
 its own quota limit, so it is not a gateway-only alias: the requested id is passed upstream verbatim and is never
-renamed to `gpt-5.6-luna`. It owns the `reserve` quota class in `src/codex_account_routing.ts`, so exhausting the
+renamed to `gpt-5.6-luna`. It owns the `reserve` quota class in `src/codex/account-routing.ts`, so exhausting the
 reserve class must not block the standard class on the same account, and standard-class exhaustion must not block
 reserve. The gateway accepts the id as a known Codex model while the upstream discovery catalog still omits it, without
 inventing a catalog entry.
@@ -743,3 +1241,35 @@ Decision evidence: DSH session-8d0f4b3a-9ab5-43e1-96e6-fd092c509c26, recovered d
 
 For the recorded cleanup, delete unused p-ai-ubq-fi and ai-ubq-fi-feat-shared-admin-toke. Retain ai-ubq-fi and
 ubiquity-prospector; the Prospector monorepo's own `DECISIONS.md` owns the latter's retention and migration decisions.
+
+## Local-development key deletion ownership - 2026-10-03
+
+For the local-development API key only, the retained paid-deletion guard keeps created_at_ms and adds local_deletion
+with an exclusive owner and completed_at_ms. Admin deletion CAS-claims ownership while the revoked ID exists, checks
+that claim before deleting the ID, and publishes completion only after all awaited paid-state, request-log, counter and
+V3 usage cleanup finishes, using the same owner version and an absent-ID CAS. A known settled pre-ID refusal or failure
+may release only its own claim for explicit admin retry; legacy and crashed active guards remain blocked without owner
+stealing. Startup reprovision requires a completed local marker, no outstanding billing, pending markers, lease or
+remaining cleanup rows, and atomically checks the absent ID, token hash and unchanged guard while publishing the
+replacement and clearing only that local guard. Empty prefixes and an absent ID alone never prove completion; every
+nonlocal guard keeps its existing meaning.
+
+## Client catalog ETags - 2026-10-03
+
+Client catalog ETags are hashes of the final bytes served to that client, in both the fast path and the assembled path.
+Raw upstream ETags remain source metadata used only for upstream conditional fetches. Enrichment that changes the served
+body changes its client validator even when upstream metadata is unchanged; only a validator for the current served body
+permits a client 304 response.
+
+## Supported VPS activation recovery - 2026-10-03
+
+For supported VPS releases, same-SHA retry uses a private atomic deployment-owned recovery receipt under the existing
+deploy lock, binding the candidate and previous full SHA, source archive and complete immutable tree digests, exact
+selectors, verified fixed listener port and known launcher/unit profile. Before ingress changes, a failed candidate
+restores the supported previous selector and actual listener/public identity; daemon-reload refusal restores only the
+selector and issues no gateway restart. After successful ingress reload, a public verification failure retains the ready
+candidate and ingress-applied intent for nondestructive same-SHA verification retry. Candidate bytes remain immutable,
+and pruning occurs only after exact loopback and public identity acceptance. Unsupported or historical root-relative
+launchers are refused before destructive activation; successful historical restoration and first-deployment rollback
+remain separate unresolved scopes. The normal deployment command must permit the verified prior loopback port, and
+verify/CI must provide the scoped shell and loopback capabilities required by every actual launcher fixture.

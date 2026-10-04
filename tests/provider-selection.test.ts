@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 
-import { handleAdminProviderSelectionGet, handleAdminProviderSelectionSet } from "../src/admin.ts";
-import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, resetCodexAuthCacheForTest } from "../src/codex.ts";
-import { DEEPSEEK_OFFICIAL_MODEL_IDS } from "../src/deepseek.ts";
-import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/codex_models_whitelist.ts";
-import handler from "../src/handler.ts";
+import { handleAdminProviderSelectionGet, handleAdminProviderSelectionSet } from "../src/admin/index.ts";
+import { CODEX_AUTH_POOL_KV_KEY, CODEX_MODELS_KV_KEY, type CodexModelsSnapshot, resetCodexAuthCacheForTest } from "../src/codex/index.ts";
+import { DEEPSEEK_OFFICIAL_MODEL_IDS } from "../src/deepseek/index.ts";
+import { handleHealthProviders } from "../src/health.ts";
+import { LITHOS_MODEL_IDS } from "../src/provider/lithos.ts";
+import { readOpenRouterApiKey } from "../src/provider/openrouter.ts";
+import { CODEX_MODELS_WHITELIST_KV_KEY } from "../src/models/codex-models-whitelist.ts";
+import handler from "../src/handler/index.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { handleModels } from "../src/openai.ts";
+import { buildModelCatalogSnapshot, handleModels } from "../src/models/catalog.ts";
+import { RECORD_PROVIDER_IDS } from "../src/provider/health.ts";
+import { PROVIDER_PRESENTATION, PROVIDER_TIERS, providerPresentation } from "../src/provider/presentation.ts";
 import {
   codexAccountEligibility,
   codexSubscriptionHash,
@@ -26,8 +31,8 @@ import {
   SELECTABLE_PROVIDER_IDS,
   storeProviderSelection,
   type SelectableProviderId,
-} from "../src/provider_selection.ts";
-import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime_config.ts";
+} from "../src/provider/selection.ts";
+import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
 
 // The model-listing path reads discovery credentials from the environment.
 // Clearing them keeps these tests on the credential-gated providers they own,
@@ -231,7 +236,7 @@ const catalogFixture = () => ({
     { id: "gpt-5.6-sol", providers: [{ id: "codex" as const, owned_by: "openai", supported_endpoints: ["/v1/responses"] }] },
     { id: "gpt-5.6-sol", providers: [{ id: "surplus" as const, owned_by: "moonshot", supported_endpoints: ["/v1/responses"] }] },
     { id: "kimi-k2", providers: [{ id: "surplus" as const, owned_by: "moonshot", supported_endpoints: ["/v1/chat/completions"] }] },
-    { id: "deepseek-flash", providers: [{ id: "deepseek" as const, owned_by: "deepseek", supported_endpoints: ["/v1/chat/completions"] }] },
+    { id: "deepseek-flash", providers: [{ id: "deepseek" as const, owned_by: "deepseek", supported_endpoints: ["/v1/chat/completions", "/v1/responses"] }] },
   ],
   sources: {
     codex: { status: "available" as const, count: 1, updated_at_ms: 1 },
@@ -239,6 +244,9 @@ const catalogFixture = () => ({
     surplus: { status: "available" as const, count: 2, updated_at_ms: 2 },
     deepseek: { status: "available" as const, count: 1, updated_at_ms: null, configured: true },
     cerebras: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
+    // The catalog source id union gained the LithosAI provider; this fixture is
+    // typed as a whole snapshot, so it must name every source id.
+    lithos: { status: "unavailable" as const, count: 0, updated_at_ms: null, configured: false },
     openrouter: { status: "available" as const, count: 2, updated_at_ms: 3 },
   },
 });
@@ -251,20 +259,118 @@ Deno.test("admin provider picker reports the roster, catalog counts, and the sav
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("cache-control"), "no-store");
     const body = await response.json();
+    const rows = [
+      { id: "codex", model_count: 1, status: "available", configured: true, subscriptions: [] },
+      { id: "surplus", model_count: 2, status: "available", configured: true },
+      { id: "openlux", model_count: 0, status: "unavailable", configured: false },
+      { id: "deepseek", model_count: 1, status: "available", configured: true },
+      { id: "cerebras", model_count: 0, status: "unavailable", configured: false },
+      { id: "lithos", model_count: 0, status: "unavailable", configured: false },
+      {
+        id: "openrouter",
+        model_count: 0,
+        status: readOpenRouterApiKey() !== null ? "available" : "unavailable",
+        configured: readOpenRouterApiKey() !== null,
+      },
+    ];
     assert.deepEqual(
       body.data.providers,
-      [
-        { id: "codex", model_count: 1, status: "available", configured: true, subscriptions: [] },
-        { id: "surplus", model_count: 2, status: "available", configured: true },
-        { id: "openlux", model_count: 0, status: "unavailable", configured: false },
-        { id: "deepseek", model_count: 1, status: "available", configured: true },
-        { id: "cerebras", model_count: 0, status: "unavailable", configured: false },
-      ],
-      "the roster is fixed and every provider carries its catalog entry count"
+      rows.map((row) => {
+        const presentation = providerPresentation(row.id);
+        return {
+          ...presentation,
+          tier_label: PROVIDER_TIERS.find((tier) => tier.id === presentation.tier)?.label,
+          ...row,
+        };
+      }),
+      "the roster is fixed and every provider carries its catalog entry count and its presentation"
+    );
+    assert.deepEqual(
+      body.data.tiers,
+      PROVIDER_TIERS.map((tier) => ({ id: tier.id, label: tier.label })),
+      "the tier filter arrives in waterfall order"
     );
     assert.deepEqual(body.data.selection.provider_ids, ["surplus"]);
     assert.equal(body.data.filter_active, true);
   });
+});
+
+Deno.test("every selectable provider carries a complete presentation and a health key the view reports", async () => {
+  const previousDeepSeekKey = Deno.env.get("DEEPSEEK_API_KEY");
+  Deno.env.set("DEEPSEEK_API_KEY", "fixture-deepseek-key");
+  try {
+    await withKv(new SelectionKv(), async () => {
+      const catalog = await buildModelCatalogSnapshot();
+      const response = await handleAdminProviderSelectionGet({ buildCatalog: () => Promise.resolve(catalog) });
+      const body = (await response.json()) as {
+        data: {
+          providers: {
+            id: string;
+            label?: string;
+            tier?: string;
+            tier_label?: string;
+            detail?: string;
+            endpoints?: string[];
+            health_key?: string;
+          }[];
+          tiers: { id: string; label: string }[];
+        };
+      };
+      assert.deepEqual(
+        body.data.providers.map((provider) => provider.id),
+        [...SELECTABLE_PROVIDER_IDS],
+        "the roster keeps the waterfall order"
+      );
+      assert.deepEqual(
+        body.data.tiers.map((tier) => tier.id),
+        PROVIDER_TIERS.map((tier) => tier.id),
+        "the tier filter is ordered"
+      );
+
+      // `/health/providers` is the provider-health view the panel reads, and it
+      // publishes exactly one key per provider it can report.
+      const healthKeys = new Set(Object.keys(await (await handleHealthProviders()).json()));
+      for (const provider of body.data.providers) {
+        const presentation = PROVIDER_PRESENTATION[provider.id as SelectableProviderId];
+        assert.ok(presentation, `${provider.id} must have a presentation entry`);
+        assert.equal(provider.label, presentation.label, `${provider.id} label`);
+        assert.equal(provider.tier, presentation.tier, `${provider.id} tier`);
+        assert.equal(provider.tier_label, PROVIDER_TIERS.find((tier) => tier.id === presentation.tier)?.label, `${provider.id} tier label`);
+        assert.equal(provider.detail, presentation.detail, `${provider.id} detail`);
+        assert.ok(typeof provider.detail === "string" && provider.detail.length > 0, `${provider.id} detail must be copy`);
+        assert.deepEqual(provider.endpoints, [...presentation.endpoints], `${provider.id} endpoints`);
+        assert.equal(provider.health_key, presentation.health_key, `${provider.id} health key`);
+        assert.equal(healthKeys.has(presentation.health_key), true, `${presentation.health_key} must be a published health key`);
+        assert.equal(RECORD_PROVIDER_IDS.includes(presentation.health_key), true, `${presentation.health_key} must be reportable provider health`);
+      }
+
+      const deepseek = body.data.providers.find((provider) => provider.id === "deepseek");
+      assert.ok(deepseek, "the roster must list deepseek");
+      assert.deepEqual(deepseek.endpoints, ["/v1/chat/completions", "/v1/responses"]);
+      assert.match(deepseek.detail ?? "", /Chat Completions upstream and Responses through the gateway's translation/);
+      for (const id of DEEPSEEK_OFFICIAL_MODEL_IDS) {
+        const provider = catalog.models.find((model) => model.id === id)?.providers.find((candidate) => candidate.id === "deepseek");
+        assert.ok(provider, `${id} must have a DeepSeek catalog provider`);
+        assert.deepEqual(deepseek.endpoints, provider.supported_endpoints, `${id} catalog and roster endpoints must agree`);
+      }
+
+      const lithos = body.data.providers.find((provider) => provider.id === "lithos");
+      assert.ok(lithos, "the roster must list lithos");
+      assert.equal(lithos.label, "LithosAI");
+      assert.equal(lithos.health_key, "lithos");
+
+      // A roster id with no copy yet still renders completely instead of dropping out.
+      const fallback = providerPresentation("future-provider");
+      assert.equal(fallback.label, "future-provider");
+      assert.equal(fallback.tier, "direct");
+      assert.match(fallback.detail, /no presentation entry yet/);
+      assert.deepEqual([...fallback.endpoints], []);
+      assert.equal(fallback.health_key, "future-provider");
+    });
+  } finally {
+    if (previousDeepSeekKey === undefined) Deno.env.delete("DEEPSEEK_API_KEY");
+    else Deno.env.set("DEEPSEEK_API_KEY", previousDeepSeekKey);
+  }
 });
 
 const stripBase64Padding = (base64: string): string => {
@@ -406,15 +512,31 @@ Deno.test("the provider picker routes are registered and stay behind admin auth"
 Deno.test("/v1/models hides the models of a switched-off provider", async () => {
   Deno.env.set("DEEPSEEK_API_KEY", "fixture-deepseek-key");
   Deno.env.set("CEREBRAS_API_KEY", "fixture-cerebras-key");
+  // This test owns every credential-gated provider, so it configures the
+  // LithosAI key itself instead of leaving the row set to the ambient
+  // environment.
+  Deno.env.set("LITHOSAI_API_KEY", "fixture-lithos-key");
+  // Same ownership for the OpenRouter upstream: this test configures its key
+  // rather than inheriting the ambient environment
+  const previousOpenRouterKey = Deno.env.get("OPENROUTER_API_KEY");
+  Deno.env.set("OPENROUTER_API_KEY", "fixture-openrouter-key");
   const kv = new SelectionKv();
   seedCodexSnapshot(kv, ["gpt-5.6-sol"]);
   try {
     await withKv(kv, async () => {
-      assert.deepEqual(await listModelIds(), ["gpt-5.6-sol", "gpt-oss-120b", ...DEEPSEEK_OFFICIAL_MODEL_IDS], "no filter lists every provider");
+      assert.deepEqual(
+        await listModelIds(),
+        ["gpt-5.6-sol", "gpt-oss-120b", "qwen-3.8-27b", ...DEEPSEEK_OFFICIAL_MODEL_IDS, ...LITHOS_MODEL_IDS, "typesafe/jev-latest"],
+        "no filter lists every provider"
+      );
 
       kv.seedSelection(["deepseek", "cerebras"]);
       resetProviderSelectionCacheForTest();
-      assert.deepEqual(await listModelIds(), ["gpt-oss-120b", ...DEEPSEEK_OFFICIAL_MODEL_IDS], "a switched-off Codex provider contributes no rows");
+      assert.deepEqual(
+        await listModelIds(),
+        ["gpt-oss-120b", "qwen-3.8-27b", ...DEEPSEEK_OFFICIAL_MODEL_IDS],
+        "a switched-off Codex provider contributes no rows"
+      );
 
       kv.seedSelection(["codex"]);
       resetProviderSelectionCacheForTest();
@@ -423,6 +545,9 @@ Deno.test("/v1/models hides the models of a switched-off provider", async () => 
   } finally {
     Deno.env.delete("DEEPSEEK_API_KEY");
     Deno.env.delete("CEREBRAS_API_KEY");
+    Deno.env.delete("LITHOSAI_API_KEY");
+    if (previousOpenRouterKey === undefined) Deno.env.delete("OPENROUTER_API_KEY");
+    else Deno.env.set("OPENROUTER_API_KEY", previousOpenRouterKey);
     resetRuntimeConfigCacheForTest();
   }
 });
