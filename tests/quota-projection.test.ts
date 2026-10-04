@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { PaidFallbackUsageRollup } from "../src/paid_fallback_rollups.ts";
+import type { PaidFallbackUsageRollup } from "../src/paid-fallback/rollups.ts";
 
 type StoredEntry = {
   key: Deno.KvKey;
@@ -172,27 +172,26 @@ const denoWithKv = Deno as unknown as { openKv?: () => Promise<Deno.Kv> };
 const originalOpenKv = denoWithKv.openKv;
 denoWithKv.openKv = () => Promise.resolve(kv);
 
-const { apiKeyHashKey, apiKeyIdKey } = await import("../src/api_keys.ts");
-const { recordMeteredTerminal, recordMeteredUpstreamResponse, recordSurplusUsage, reservePaidFallback } = await import("../src/paid_fallback.ts");
+const { apiKeyHashKey, apiKeyIdKey } = await import("../src/api-keys.ts");
+const { recordMeteredTerminal, recordMeteredUpstreamResponse, recordSurplusUsage, reservePaidFallback } = await import("../src/paid-fallback/index.ts");
+const { backfillPaidFallbackUsageRollups, backfillPaidFallbackWindowTtls } = await import("../src/paid-fallback/ledger-backfill.ts");
 const {
-  backfillPaidFallbackUsageRollups,
-  backfillPaidFallbackWindowTtls,
   PAID_FALLBACK_REQUEST_LOG_RETENTION_MS,
   paidFallbackBackfillCursorV3Key,
   paidFallbackBackfillWindowCursorV3Key,
   paidFallbackRequestV3Key,
   paidFallbackWindowV3Key,
-} = await import("../src/paid_fallback_ledger.ts");
-const { listPaidFallbackUsageRollups, mergePaidFallbackUsageRollup, paidFallbackUsageRollupKey } = await import("../src/paid_fallback_rollups.ts");
+} = await import("../src/paid-fallback/ledger-state.ts");
+const { listPaidFallbackUsageRollups, mergePaidFallbackUsageRollup, paidFallbackUsageRollupKey } = await import("../src/paid-fallback/rollups.ts");
 const {
   METERED_QUOTA_BALANCE_HISTORY_DAILY_BUCKET_MS,
   METERED_QUOTA_BALANCE_HISTORY_PREFIX,
   normalizeMeteredQuotaBalanceWindowDays,
   readMeteredQuotaBalanceHistory,
   resampleMeteredQuotaBalanceHistory,
-} = await import("../src/metered_quota.ts");
+} = await import("../src/metered-quota.ts");
 const { groupPaidFallbackUsageRollups, meteredQuotaRunwayView, projectPaidFallbackRunway, summarizePaidFallbackUsage } =
-  await import("../src/quota_projection.ts");
+  await import("../src/quota-projection.ts");
 const {
   estimatePaidFallbackRecordBytes,
   isPaidFallbackLedgerDailyStats,
@@ -202,7 +201,7 @@ const {
   paidFallbackLedgerStatsDayStart,
   readPaidFallbackLedgerGrowth,
   recordPaidFallbackLedgerProjectionStats,
-} = await import("../src/paid_fallback_ledger_stats.ts");
+} = await import("../src/paid-fallback/ledger-stats.ts");
 const { getKv } = await import("../src/kv.ts");
 await getKv();
 
@@ -211,8 +210,8 @@ denoWithKv.openKv = originalOpenKv;
 type ApiKeyRecord = import("../src/types.ts").ApiKeyRecord;
 type PaidFallbackRequestV3 = import("../src/types.ts").PaidFallbackRequestV3;
 type PaidFallbackWindowV3 = import("../src/types.ts").PaidFallbackWindowV3;
-type MeteredQuotaSnapshot = import("../src/metered_quota.ts").MeteredQuotaSnapshot;
-type PaidFallbackLedgerDailyStats = import("../src/paid_fallback_ledger_stats.ts").PaidFallbackLedgerDailyStats;
+type MeteredQuotaSnapshot = import("../src/metered-quota.ts").MeteredQuotaSnapshot;
+type PaidFallbackLedgerDailyStats = import("../src/paid-fallback/ledger-stats.ts").PaidFallbackLedgerDailyStats;
 
 const keyId = "quota-projection-key";
 const keyHash = "quota-projection-hash";
@@ -956,8 +955,9 @@ Deno.test("ledger growth view derives bytes-per-row and the storage alert thresh
   assert.equal(growth.active_days, 1);
   assert.equal(growth.read_units, 2);
   const p90 = growth.projections.find((entry) => entry.window_days === 90);
-  assert.equal(p90?.avg_read_units_per_view, 400);
-  assert.equal(p90?.avg_rollup_rows_per_view, 2_000);
+  assert.ok(p90, "the 90-day projection summary must exist");
+  assert.equal(p90.avg_read_units_per_view, 400);
+  assert.equal(p90.avg_rollup_rows_per_view, 2_000);
   assert.equal(growth.leaderboard.length, 1);
   assert.equal(growth.leaderboard[0]?.projection_views, 7);
 
@@ -1005,7 +1005,7 @@ Deno.test("admin quota projection records and exposes the measured ledger growth
     const originalFetch = globalThis.fetch;
     globalThis.fetch = () => Promise.reject(new Error("offline projection test"));
     try {
-      const { handleAdminProvidersQuotaProjection } = await import("../src/admin.ts");
+      const { handleAdminProvidersQuotaProjection } = await import("../src/admin/kernel.ts");
       const dayKey = paidFallbackLedgerStatsDayKey(paidFallbackLedgerStatsDayStart(Date.now()));
       const before = (await memoryKv.get<PaidFallbackLedgerDailyStats>(dayKey)).value;
       const response = await handleAdminProvidersQuotaProjection(new Request("https://ai.ubq.fi/admin/providers/quota-projection?window_days=30"));
@@ -1013,8 +1013,12 @@ Deno.test("admin quota projection records and exposes the measured ledger growth
       const payload = (await response.json()) as {
         ledger_growth?: { scan?: string; read_units?: number; projections?: { window_days: number; views: number; read_units: number }[] };
       };
-      assert.equal(payload.ledger_growth?.scan, "ok");
-      assert.deepEqual(payload.ledger_growth?.projections?.map((entry) => entry.window_days), [7, 30, 90]);
+      assert.ok(payload.ledger_growth, "the projection payload must carry the ledger growth view");
+      assert.equal(payload.ledger_growth.scan, "ok");
+      assert.deepEqual(
+        payload.ledger_growth.projections?.map((entry) => entry.window_days),
+        [7, 30, 90]
+      );
 
       // The view measures itself for the next reader: the 30-day counters grew
       // by exactly one view whose read units cover the three scans plus entries.

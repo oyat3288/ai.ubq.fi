@@ -6,7 +6,8 @@
     "ops/**/*.ts",
     "benchmarks/**/*.ts",
     "tests/**/*.test.ts",
-    "tests/**/*.e2e.ts"
+    "tests/**/*.e2e.ts",
+    "tests/helpers/codex-native-auth-acceptance.ts"
   ],
   "project": [
     "src/**/*.ts",
@@ -33,22 +34,22 @@
     "src/kv.ts": [
       "exports"
     ],
-    "src/local_admin_auth.ts": [
+    "src/auth/local-admin.ts": [
       "exports"
     ],
-    "src/provider_capacity.ts": [
+    "src/provider/capacity.ts": [
       "duplicates"
     ],
-    "src/inference_deadline.ts": [
+    "src/inference-deadline.ts": [
       "duplicates"
     ],
-    "src/kernel_quota_v2.ts": [
+    "src/kernel/quota-v2.ts": [
       "duplicates"
     ],
-    "src/metered.ts": [
+    "src/provider/metered.ts": [
       "duplicates"
     ],
-    "src/codex_models_whitelist.ts": [
+    "src/models/codex-models-whitelist.ts": [
       "files"
     ]
   }

@@ -15,7 +15,7 @@
     <link rel="icon" href="/favicon.png" type="image/png" sizes="256x256" />
     <link rel="stylesheet" href="/style.css?v=passport-design-20260922" />
     <link rel="stylesheet" href="/admin.css?v=passport-design-20260922" />
-    <link rel="stylesheet" href="/admin-supervisor.css?v=20260922-supervisor-v1" />
+    <link rel="stylesheet" href="/admin-supervisor.css?v=20261001-supervisor-v4" />
   </head>
   <body data-page="admin" data-role="admin" data-auth-widget="collapsed" data-auth-scope="none">
     <div data-shell>
@@ -637,22 +637,9 @@
                 aria-label="Provider capacity history"
               ></div>
               <div id="provider-capacity-list" data-capacity-list role="list"></div>
+              <p id="provider-capacity-ledger" data-muted data-help></p>
             </div>
           </article>
-
-          <details data-card data-provider-details>
-            <summary id="card-quota-runway">Quota forecast</summary>
-            <div data-card-body>
-              <div data-provider-heading>
-                <span id="quota-runway-badge" data-badge data-state="unknown">Not loaded</span>
-                <span id="quota-runway-updated" data-muted>Waiting for projection</span>
-              </div>
-              <div id="quota-runway-summary" data-quota-runway-summary role="status"></div>
-              <div id="quota-runway-list" data-quota-runway-list role="list"></div>
-              <p id="quota-runway-note" data-muted></p>
-              <p id="quota-runway-ledger" data-muted></p>
-            </div>
-          </details>
         </section>
 
         <section
@@ -693,23 +680,7 @@
                     <option value="id">Provider A–Z</option>
                   </select>
                 </label>
-                <div data-provider-filters role="group" aria-label="Filter by tier">
-                  <button id="providers-selection-tier-all" type="button" data-provider-tier="all" aria-pressed="true">
-                    All <span data-provider-filter-count>0</span>
-                  </button>
-                  <button id="providers-selection-tier-subscription" type="button" data-provider-tier="subscription"
-                    aria-pressed="false">
-                    Subscription <span data-provider-filter-count>0</span>
-                  </button>
-                  <button id="providers-selection-tier-paid" type="button" data-provider-tier="paid"
-                    aria-pressed="false">
-                    Paid fallback <span data-provider-filter-count>0</span>
-                  </button>
-                  <button id="providers-selection-tier-direct" type="button" data-provider-tier="direct"
-                    aria-pressed="false">
-                    Direct <span data-provider-filter-count>0</span>
-                  </button>
-                </div>
+                <div data-provider-filters role="group" aria-label="Filter by tier"></div>
                 <label data-check="only-active">
                   <input id="providers-selection-only-active" type="checkbox" />
                   <span>Only active</span>
@@ -767,6 +738,8 @@
                 <span id="errors-badge" data-badge data-state="unknown">Not loaded</span>
                 <span id="errors-updated" data-muted>Waiting for history</span>
               </div>
+              <p id="errors-retention" data-muted role="status"
+                aria-live="polite">Capture storage status unavailable.</p>
               <div id="errors-list" data-key-list role="list" aria-live="polite"></div>
             </div>
           </article>
@@ -801,32 +774,7 @@
                     <option value="created">Newest first</option>
                   </select>
                 </label>
-                <div data-model-filters role="group" aria-label="Filter by provider">
-                  <button id="models-whitelist-provider-all" type="button" data-model-provider="all"
-                    aria-pressed="true">
-                    All <span data-model-filter-count>0</span>
-                  </button>
-                  <button id="models-whitelist-provider-codex" type="button" data-model-provider="codex"
-                    aria-pressed="false">
-                    Codex <span data-model-filter-count>0</span>
-                  </button>
-                  <button id="models-whitelist-provider-openlux" type="button" data-model-provider="openlux"
-                    aria-pressed="false">
-                    Metered 2 <span data-model-filter-count>0</span>
-                  </button>
-                  <button id="models-whitelist-provider-surplus" type="button" data-model-provider="surplus"
-                    aria-pressed="false">
-                    Metered 1 <span data-model-filter-count>0</span>
-                  </button>
-                  <button id="models-whitelist-provider-deepseek" type="button" data-model-provider="deepseek"
-                    aria-pressed="false">
-                    DeepSeek <span data-model-filter-count>0</span>
-                  </button>
-                  <button id="models-whitelist-provider-cerebras" type="button" data-model-provider="cerebras"
-                    aria-pressed="false">
-                    Cerebras <span data-model-filter-count>0</span>
-                  </button>
-                </div>
+                <div data-model-filters role="group" aria-label="Filter by provider"></div>
                 <label data-check="only-selected">
                   <input id="models-whitelist-only-selected" type="checkbox" />
                   <span>Only checked</span>
@@ -888,9 +836,8 @@
               <span data-admin-eyebrow>Read-only observation</span>
               <h2 id="card-supervisor">Codex supervisor</h2>
               <p>
-                See which Codex sessions are running on each connected machine, what they are working on, and what they are
-                waiting for. This panel only reads: it never resumes, steers, approves, or stops a session. A session is
-                active only when its runtime status says so, not because its timestamp is recent.
+                Every session is reported as its runtime state describes it; this panel only reads and never resumes,
+                steers, approves, or stops a session.
               </p>
             </header>
             <div data-card-body>
@@ -926,33 +873,39 @@
                 </label>
               </div>
               <div id="supervisor-notice" hidden></div>
-              <div id="supervisor-list" data-key-list role="list" aria-live="polite"></div>
-              <p id="supervisor-empty" data-empty>Waiting for the first sample.</p>
-              <section id="supervisor-follow" aria-label="Follow recorded output" hidden>
-                <div data-provider-heading>
-                  <strong id="supervisor-follow-title">Follow output</strong>
-                  <button id="supervisor-follow-stop" type="button">Stop following</button>
+              <div data-supervisor-columns>
+                <div data-supervisor-sessions>
+                  <div id="supervisor-list" data-key-list role="list"></div>
+                  <p id="supervisor-empty" data-empty>Waiting for the first sample.</p>
                 </div>
-                <p id="supervisor-follow-status" data-muted></p>
-                <div id="supervisor-follow-log" role="log" aria-live="polite"></div>
-              </section>
-              <section id="supervisor-brief" aria-label="Session brief" hidden>
-                <div data-provider-heading>
-                  <strong id="supervisor-brief-title">Session brief</strong>
-                  <button id="supervisor-brief-close" type="button">Close</button>
+                <div data-supervisor-inspector>
+                  <section id="supervisor-follow" aria-label="Follow recorded output" hidden>
+                    <div data-provider-heading>
+                      <strong id="supervisor-follow-title">Follow output</strong>
+                      <button id="supervisor-follow-stop" type="button">Stop following</button>
+                    </div>
+                    <p id="supervisor-follow-status" data-muted></p>
+                    <div id="supervisor-follow-log" role="log" aria-live="polite"></div>
+                  </section>
+                  <section id="supervisor-brief" aria-label="Session brief" hidden>
+                    <div data-provider-heading>
+                      <strong id="supervisor-brief-title">Session brief</strong>
+                      <button id="supervisor-brief-close" type="button">Close</button>
+                    </div>
+                    <p id="supervisor-brief-status" data-muted></p>
+                    <div id="supervisor-brief-body" hidden>
+                      <div data-brief-section>
+                        <h3>About this session</h3>
+                        <p id="supervisor-brief-about"></p>
+                      </div>
+                      <div data-brief-section>
+                        <h3>Current status</h3>
+                        <p id="supervisor-brief-state"></p>
+                      </div>
+                    </div>
+                  </section>
                 </div>
-                <p id="supervisor-brief-status" data-muted></p>
-                <div id="supervisor-brief-body" hidden>
-                  <div data-brief-section>
-                    <h3>About this session</h3>
-                    <p id="supervisor-brief-about"></p>
-                  </div>
-                  <div data-brief-section>
-                    <h3>Current status</h3>
-                    <p id="supervisor-brief-state"></p>
-                  </div>
-                </div>
-              </section>
+              </div>
             </div>
           </article>
         </section>
@@ -1072,6 +1025,6 @@
         </button>
       </section>
     </div>
-    <script type="module" src="/admin.js?v=passport-design-20260922"></script>
+    <script type="module" src="/admin.js?v=analytics-trim-20261003"></script>
   </body>
 </html>
