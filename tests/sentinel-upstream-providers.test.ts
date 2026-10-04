@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { apiKeyHashKey, apiKeyIdKey } from "../src/api_keys.ts";
-import { ApiKeyQuotaDispatchError } from "../src/api_key_policy.ts";
-import { CEREBRAS_CHAT_COMPLETIONS_URL, fetchCerebrasChatCompletions } from "../src/cerebras.ts";
-import { DEEPSEEK_CHAT_COMPLETIONS_URL, fetchDeepSeekChatCompletions } from "../src/deepseek.ts";
+import { apiKeyHashKey, apiKeyIdKey } from "../src/api-keys.ts";
+import { ApiKeyQuotaDispatchError } from "../src/api-key-policy.ts";
+import { CEREBRAS_CHAT_COMPLETIONS_URL, fetchCerebrasChatCompletions } from "../src/provider/cerebras.ts";
+import { DEEPSEEK_CHAT_COMPLETIONS_URL, fetchDeepSeekChatCompletions } from "../src/deepseek/index.ts";
+import { LITHOS_CHAT_COMPLETIONS_URL } from "../src/provider/lithos.ts";
+import { OPENROUTER_CHAT_COMPLETIONS_URL } from "../src/provider/openrouter.ts";
 import {
   CODEX_AUTH_POOL_KV_KEY,
   fetchCodexResponses,
@@ -10,14 +12,14 @@ import {
   getCodexResponseSlot,
   markCodexResponseCompleted,
   resetCodexAuthCacheForTest,
-} from "../src/codex.ts";
-import { resetCodexAccountRoutingForTest } from "../src/codex_account_routing.ts";
+} from "../src/codex/index.ts";
+import { resetCodexAccountRoutingForTest } from "../src/codex/account-routing.ts";
 import { config } from "../src/config.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { fetchMeteredResponses, METERED_BASE_URL } from "../src/metered.ts";
-import { resetProviderHealthThrottleForTest } from "../src/provider_health.ts";
-import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime_config.ts";
-import { fetchSurplusResponses, SURPLUS_BASE_URL, SurplusError } from "../src/surplus.ts";
+import { fetchMeteredResponses, METERED_BASE_URL } from "../src/provider/metered.ts";
+import { resetProviderHealthThrottleForTest } from "../src/provider/health.ts";
+import { resetRuntimeConfigCacheForTest, RUNTIME_CONFIG_V2_KEY } from "../src/runtime-config.ts";
+import { fetchSurplusResponses, SURPLUS_BASE_URL, SurplusError } from "../src/provider/surplus.ts";
 import {
   decryptExportedSentinelReplay,
   type ExportedSentinelReplayCapture,
@@ -25,7 +27,7 @@ import {
   resolveSentinelClientFailureObservation,
   type SentinelFailureObservation,
   shouldPersistSentinelReplay,
-} from "../src/sentinel_replay_capture.ts";
+} from "../src/sentinel/replay-capture.ts";
 import {
   createSentinelUpstreamRecorder,
   type SentinelUpstreamAttempt,
@@ -33,13 +35,13 @@ import {
   type SentinelUpstreamProvider,
   type SentinelUpstreamTerminal,
   type SentinelUpstreamTrace,
-} from "../src/sentinel_upstream_capture.ts";
+} from "../src/sentinel/upstream-capture.ts";
 import { createRecordedUpstreamReplay } from "./helpers/sentinel-recorded-upstream.ts";
 import sentinelHistoricalFraming from "./fixtures/sentinel-historical-framing.json" with { type: "json" };
 import { base64UrlDecode, base64UrlEncode, encodeHex, sha256Base64Url } from "../src/utils.ts";
 import type { CodexAuthPoolState, CodexAuthState } from "../src/types.ts";
 
-const { default: handler } = await import("../src/handler.ts");
+const { default: handler } = await import("../src/handler/index.ts");
 
 const kvAvailable = typeof Deno.openKv === "function";
 
@@ -58,6 +60,8 @@ const REPLAY_ROUTES: Readonly<Record<SentinelUpstreamProvider, string>> = Object
   metered: `${METERED_BASE_URL}/v1/responses`,
   cerebras: CEREBRAS_CHAT_COMPLETIONS_URL,
   deepseek: DEEPSEEK_CHAT_COMPLETIONS_URL,
+  lithos: LITHOS_CHAT_COMPLETIONS_URL,
+  openrouter: OPENROUTER_CHAT_COMPLETIONS_URL,
 });
 
 const decodeChunks = (trace: ReturnType<ReturnType<typeof createSentinelUpstreamRecorder>["snapshotAndSeal"]>): string =>

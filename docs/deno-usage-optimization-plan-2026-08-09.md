@@ -135,11 +135,6 @@ bytes, ledger separation, and durable-operation floors.
 | Bounded API key, client disconnect           |            13 |               6 |              3 |                 12 |                 2 |           209 |             63 |               12 |
 | Bounded API key, eight concurrent admissions |           128 |               8 |              4 |                110 |                 8 |           209 |            181 |              123 |
 
-Since that sample, the terminal usage rollup (`docs/log-retention-and-quota-runway-2026-08-25.md`) deliberately adds one
-strong read, one write mutation and one atomic commit for every terminal response on a route the paid ledger cannot see.
-The fixture records that cost per scenario instead of absorbing it: the before/after table lives in the rollup document,
-and `bounded_api_key:client_disconnect` now asserts exactly one usage-rollup read and one merge commit.
-
 Before this fixture, this worktree had no per-auth-kind command/atomic or Codex serialization-byte baseline. The
 required implementation handoff ties this table to its exact tested commit. The fixture asserts that UOS and admin
 allowlist paths do not access V3 API-key ledger keys, while the bounded paths retain durable reservation, dispatch, and
@@ -217,6 +212,11 @@ Tasks:
 
 **Acceptance:** an operator can identify a rising egress or KV trend before an overage, and all estimates state their
 sampling window and units.
+
+**Paid-fallback status (2026-09-22):** the paid-fallback ledger now writes daily settled-row/rollup byte counters and
+per-window admin projection read units (`uos_ai/paid_fallback/v3/ledger_stats/<utc-day>`), exposed as `ledger_growth` on
+`GET /admin/providers/quota-projection` with a storage alert at 80% of the 5 GiB Pro allowance. See
+docs/log-retention-and-quota-runway-2026-08-25.md for the measured fixture baseline and the field list.
 
 ## Integration order
 

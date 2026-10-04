@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 
-import { withTerminalRequestLog } from "../src/handler.ts";
+import { withTerminalRequestLog } from "../src/handler/terminal-log.ts";
 import { setKvForTest } from "../src/kv.ts";
-import { CountingKv } from "./helpers/counting_kv.ts";
+import { attachResponseTelemetry, createResponseTelemetryState } from "../src/openai-telemetry.ts";
+import { listPaidFallbackUsageRollups } from "../src/paid-fallback/rollups.ts";
+import { CountingKv } from "./helpers/counting-kv.ts";
 
 type TerminalLogInput = Parameters<typeof withTerminalRequestLog>[1];
 type RecordUsageRollup = NonNullable<TerminalLogInput["recordUsageRollup"]>;
 type UsageRollupInput = Parameters<RecordUsageRollup>[0];
 type RecordTelemetry = NonNullable<TerminalLogInput["recordTelemetry"]>;
 type RecordAnalytics = NonNullable<TerminalLogInput["recordCacheAnalytics"]>;
+
+const HOUR_MS = 60 * 60 * 1_000;
 
 const ignoredTelemetry: RecordTelemetry = () =>
   Promise.resolve({
@@ -31,6 +35,22 @@ const ignoredAnalytics: RecordAnalytics = () =>
 const codexResponse = (): Response =>
   new Response("complete", { status: 200, headers: { "Content-Type": "application/json", "x-uos-upstream": "chatgpt_codex" } });
 
+/** A Codex response whose telemetry observed the request's token usage. */
+const codexResponseWithUsage = (): Response => {
+  const response = codexResponse();
+  attachResponseTelemetry(response, {
+    ...createResponseTelemetryState(),
+    provider: "chatgpt_codex",
+    model: "gpt-5.6-sol",
+    inputTokens: 120,
+    cachedInputTokens: 40,
+    outputTokens: 30,
+    usageObserved: true,
+    usageTelemetryStatus: "reported",
+  });
+  return response;
+};
+
 const terminalOptions = (requestId: string, extra: Partial<TerminalLogInput> = {}): TerminalLogInput => ({
   route: "responses",
   startedAtMonotonicMs: performance.now(),
@@ -40,11 +60,11 @@ const terminalOptions = (requestId: string, extra: Partial<TerminalLogInput> = {
   ...extra,
 });
 
-Deno.test("terminal usage accounting records exactly one Codex observation with the request hour", async () => {
+Deno.test("terminal usage accounting records one observation with the observed request hour and usage", async () => {
   const observations: UsageRollupInput[] = [];
   const requestStartedAtMs = Date.parse("2026-09-22T16:00:00Z");
   const response = await withTerminalRequestLog(
-    codexResponse(),
+    codexResponseWithUsage(),
     terminalOptions("handler-usage-rollup-codex", {
       requestStartedAtMs,
       recordUsageRollup: (input) => {
@@ -58,17 +78,17 @@ Deno.test("terminal usage accounting records exactly one Codex observation with 
   assert.equal(await response.text(), "complete");
   assert.equal(observations.length, 1, "one terminal response records exactly one usage observation");
   assert.deepEqual(observations[0], {
-    model: null,
+    model: "gpt-5.6-sol",
     provider: "chatgpt_codex",
     request_id: "handler-usage-rollup-codex",
     request_created_at_ms: requestStartedAtMs,
-    input_tokens: null,
-    cached_input_tokens: null,
-    output_tokens: null,
+    input_tokens: 120,
+    cached_input_tokens: 40,
+    output_tokens: 30,
   });
 });
 
-Deno.test("terminal usage accounting falls back to the terminal clock on rejection paths", async () => {
+Deno.test("terminal usage accounting falls back to the terminal clock when no request start is supplied", async () => {
   const observations: UsageRollupInput[] = [];
   const before = Date.now();
   const response = await withTerminalRequestLog(
@@ -109,7 +129,7 @@ Deno.test("a failed terminal usage-rollup write never changes the terminal respo
   assert.equal(await response.text(), "complete");
 });
 
-Deno.test("terminal usage accounting performs no KV work for settled, aggregate or route-less terminals", async () => {
+Deno.test("terminal usage accounting performs no KV work for settled, aggregate, route-less or unobserved terminals", async () => {
   const kv = new CountingKv();
   setKvForTest(kv as unknown as Deno.Kv);
   try {
@@ -125,8 +145,47 @@ Deno.test("terminal usage accounting performs no KV work for settled, aggregate 
       terminalOptions("handler-usage-rollup-skip-gateway")
     );
     assert.equal(await gateway.text(), "complete");
-    assert.equal(kv.commands.length, 0, "the usage-rollup writer must skip settled providers, aggregate labels and route-less terminals before any KV call");
+    // The Codex route is real but this response never reported usage, so the
+    // writer must skip it instead of recording a fabricated zero-token row.
+    const unobserved = await withTerminalRequestLog(codexResponse(), terminalOptions("handler-usage-rollup-skip-unobserved"));
+    assert.equal(await unobserved.text(), "complete");
+    assert.equal(kv.commands.length, 0, "a skipped observation must reach no KV call");
     assert.equal(kv.entries.size, 0, "a skipped observation must not create a rollup entry");
+  } finally {
+    setKvForTest(null);
+  }
+});
+
+Deno.test("one observed terminal response writes exactly one rollup merge with actual tokens and no ledger charge", async () => {
+  const kv = new CountingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  try {
+    const requestStartedAtMs = Date.parse("2026-09-22T16:00:00Z");
+    const response = await withTerminalRequestLog(codexResponseWithUsage(), terminalOptions("handler-usage-rollup-observed", { requestStartedAtMs }));
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "complete");
+
+    const rollupCommands = kv.commands.filter((record) =>
+      record.keys.some((key) => key[0] === "uos_ai" && key[1] === "paid_fallback" && key[3] === "usage_rollup")
+    );
+    assert.equal(rollupCommands.filter((record) => record.command === "get").length, 1, "the writer reads its shard once");
+    assert.equal(
+      rollupCommands.filter((record) => record.command === "atomic.commit" && record.atomicResult === "committed").length,
+      1,
+      "the writer merges once without a retry"
+    );
+
+    const rollups = await listPaidFallbackUsageRollups(kv as unknown as Deno.Kv, { sinceMs: requestStartedAtMs - 1, nowMs: requestStartedAtMs + 1 });
+    assert.equal(rollups.length, 1);
+    assert.equal(rollups[0]?.provider, "chatgpt_codex");
+    assert.equal(rollups[0]?.model, "gpt-5.6-sol");
+    assert.equal(rollups[0]?.request_count, 1);
+    assert.equal(rollups[0]?.input_tokens, 120);
+    assert.equal(rollups[0]?.cached_input_tokens, 40);
+    assert.equal(rollups[0]?.output_tokens, 30);
+    assert.equal(rollups[0]?.quota_sum, 0);
+    assert.equal(rollups[0]?.spend_microcredits, 0);
+    assert.equal(rollups[0]?.bucket_start_at_ms, Math.floor(requestStartedAtMs / HOUR_MS) * HOUR_MS);
   } finally {
     setKvForTest(null);
   }
