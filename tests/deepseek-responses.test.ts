@@ -1,24 +1,10 @@
 import assert from "node:assert/strict";
 
-import {
-  createDeepSeekResponsesStreamTranslator,
-  DEEPSEEK_RECHECK_INSTRUCTION,
-  DEEPSEEK_RECHECK_MAX_TOKENS,
-  type DeepSeekRecheckSkipReason,
-  type DeepSeekResponsesEcho,
-  deepSeekRecheckEligibility,
-  deepSeekRecheckToolCalls,
-  deepSeekResponsesTerminalKind,
-  encodeResponsesEvent,
-  measurableDeepSeekRecheckUsage,
-  mergeDeepSeekRecheckUsage,
-  toDeepSeekChatMessages,
-  toDeepSeekRecheckChatBody,
-  toDeepSeekResponsesChatBody,
-  toDeepSeekResponsesPayload,
-  toResponsesUsage,
-} from "../src/deepseek_responses.ts";
-import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek.ts";
+import { type DeepSeekResponsesEcho, toDeepSeekResponsesPayload, toResponsesUsage } from "../src/deepseek/responses-payload.ts";
+import { createDeepSeekResponsesStreamTranslator, deepSeekResponsesTerminalKind, encodeResponsesEvent } from "../src/deepseek/responses-stream.ts";
+import { toDeepSeekChatMessages, toDeepSeekResponsesChatBody } from "../src/deepseek/chat-projection.ts";
+import { type ForwardedPayloadElision, FORWARDED_PAYLOAD_POLICY } from "../src/deepseek/forwarded-payload-policy.ts";
+import { deepSeekFinishDisposition, deepSeekThinkingToolChoiceConflict } from "../src/deepseek/index.ts";
 
 const echo: DeepSeekResponsesEcho = { tools: undefined, tool_choice: undefined, parallel_tool_calls: true, instructions: null };
 
@@ -214,9 +200,72 @@ Deno.test("deepseek responses: flattens namespaced tools and drops what the API 
     tools.map((tool) => tool.function.name),
     ["now", "clock_now", "sleep"]
   );
-  // A disambiguated name maps back to the name the client asked for.
-  assert.equal(toolNames.get("clock_now"), "now");
+  // A namespaced tool keeps the namespace the client resolves the call with, so
+  // a flattened Chat name round-trips to the exact Responses identity.
+  assert.deepEqual(toolNames.get("clock_now"), { name: "now", namespace: "clock" });
+  assert.deepEqual(toolNames.get("sleep"), { name: "sleep", namespace: "clock" });
+  assert.equal(toolNames.has("now"), false);
   assert.deepEqual(body.tool_choice, { type: "function", function: { name: "now" } });
+});
+
+Deno.test("deepseek responses: a namespaced tool call returns its namespace to the client", () => {
+  const body = toDeepSeekResponsesChatBody(
+    {
+      input: "hi",
+      tools: [{ type: "namespace", name: "collaboration", tools: [{ type: "function", name: "spawn_agent", parameters: { type: "object" } }] }],
+    },
+    "deepseek-v4-flash",
+    false
+  );
+  assert.equal(body.ok, true);
+  const toolCall = { id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } };
+  const payload = toDeepSeekResponsesPayload(
+    chatCompletion({ content: "", tool_calls: [toolCall] }),
+    "deepseek-v4-flash",
+    "resp_ns",
+    echo,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
+    id: "fc_resp_ns_0_0",
+    type: "function_call",
+    status: "completed",
+    call_id: "call_1",
+    name: "spawn_agent",
+    namespace: "collaboration",
+    arguments: "{}",
+  });
+
+  const translator = createDeepSeekResponsesStreamTranslator(
+    "deepseek-v4-flash",
+    "resp_ns_stream",
+    echo,
+    1_780_000_000,
+    body.value.toolNames,
+    body.value.customToolNames
+  );
+  translator.open();
+  const events = [
+    ...translator.push(chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "spawn_agent", arguments: "{}" } }] })),
+    ...translator.finish(),
+  ];
+  const added = events.find((event) => event.type === "response.output_item.added") as { item: Record<string, unknown> };
+  assert.equal(added.item.name, "spawn_agent");
+  assert.equal(added.item.namespace, "collaboration");
+  const completed = events.filter((event) => event.type === "response.completed");
+  assert.equal(completed.length, 1);
+  assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
+    {
+      id: "fc_resp_ns_stream_0",
+      type: "function_call",
+      status: "completed",
+      call_id: "call_1",
+      name: "spawn_agent",
+      namespace: "collaboration",
+      arguments: "{}",
+    },
+  ]);
 });
 
 Deno.test("deepseek responses: replays reasoning on tool turns because the provider requires it", () => {
@@ -481,7 +530,7 @@ Deno.test("deepseek responses: freeform tools round-trip through the function-on
     body.value.customToolNames
   );
   assert.deepEqual((payload.output as Record<string, unknown>[])[0], {
-    id: "resp_1_ctc_0_0",
+    id: "ctc_resp_1_0_0",
     type: "custom_tool_call",
     status: "completed",
     call_id: "call_1",
@@ -530,8 +579,82 @@ Deno.test("deepseek responses: a streamed freeform call emits custom tool events
   const completed = events.filter((event) => event.type === "response.completed");
   assert.equal(completed.length, 1);
   assert.deepEqual((completed[0].response as { output: Record<string, unknown>[] }).output, [
-    { id: "resp_1_fc_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
+    { id: "ctc_resp_1_0", type: "custom_tool_call", status: "completed", call_id: "call_1", name: "exec", input: "text(hi);" },
   ]);
+});
+
+Deno.test("deepseek responses: projects a sub-agent message envelope onto a user turn", () => {
+  const plaintextPayload = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "delegate this" }] },
+      {
+        type: "agent_message",
+        author: "/root/probe_qwen2",
+        recipient: "/root",
+        content: [
+          { type: "input_text", text: "ok" },
+          // A thread whose model runs outside the ChatGPT backend carries its
+          // payload here in the clear, so it must reach the model.
+          { type: "encrypted_content", encrypted_content: "payload-from-worker" },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(plaintextPayload.ok, true);
+  assert.deepEqual(plaintextPayload.value, [
+    { role: "user", content: "delegate this" },
+    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\npayload-from-worker" },
+  ]);
+
+  // A sealed payload is a Fernet token only the ChatGPT backend can open, so it
+  // is declared instead of forwarded as ciphertext.
+  const sealedPayload = toDeepSeekChatMessages(
+    [
+      {
+        type: "agent_message",
+        author: "/root",
+        recipient: "/root/worker",
+        content: [
+          { type: "input_text", text: "Message Type: NEW_TASK" },
+          { type: "encrypted_content", encrypted_content: `gAAAAA${"A".repeat(120)}` },
+        ],
+      },
+    ],
+    null
+  );
+  assert.equal(sealedPayload.ok, true);
+  assert.deepEqual(sealedPayload.value, [
+    {
+      role: "user",
+      content: "[agent message] /root -> /root/worker:\nMessage Type: NEW_TASK\n[gateway: 1 sealed agent-message part(s) were not readable and omitted]",
+    },
+  ]);
+});
+
+Deno.test("deepseek responses: bounds oversized sub-agent payloads under the declared policy", () => {
+  const oversized = "x".repeat(FORWARDED_PAYLOAD_POLICY.perMessageLimit + 1_000);
+  const message = {
+    type: "agent_message",
+    author: "/root/worker",
+    recipient: "/root",
+    content: [{ type: "encrypted_content", encrypted_content: oversized }],
+  };
+  const elisions: ForwardedPayloadElision[] = [];
+  const reduced = toDeepSeekChatMessages([message], null, "reduce", elisions);
+  assert.equal(reduced.ok, true);
+  const content = (reduced.value[0] as { content: string }).content;
+  assert.ok(content.length < oversized.length, "the payload must be reduced below its original size");
+  assert.ok(content.includes(FORWARDED_PAYLOAD_POLICY.version), "the elision marker must name the policy version");
+  assert.equal(elisions.length, 1);
+  assert.equal(elisions[0].kind, "agent_message");
+  assert.ok(elisions[0].omittedBytes > 0);
+  assert.equal(elisions[0].path, "input[0].content");
+
+  // An explicit truncation "disabled" fails closed instead of mutating the input.
+  const rejected = toDeepSeekChatMessages([message], null, "reject", []);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.code, "context_length_exceeded");
 });
 
 Deno.test("deepseek responses: rejects unsupported wire requests instead of approximating them", () => {
@@ -566,7 +689,7 @@ Deno.test("deepseek responses: builds a completed Responses object from a Chat c
     "deepseek-v4-flash",
     "resp_test",
     echo,
-    new Map([["clock_now", "now"]])
+    new Map([["clock_now", { name: "now", namespace: "clock" }]])
   );
   assert.equal(payload.object, "response");
   assert.equal(payload.status, "completed");
@@ -705,7 +828,7 @@ Deno.test("deepseek responses: the reasoning item announces the index it answers
   // The item lifecycle must therefore exist before any later item advances the
   // index, and every reasoning event must name that item's own index and id.
   const responseId = "resp_reason_life";
-  const reasoningId = `${responseId}_rs_0`;
+  const reasoningId = `rs_${responseId}_0`;
   const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", responseId, echo, 1_780_000_000);
   const events: Record<string, unknown>[] = [];
   events.push(...translator.push(chatChunk({ role: "assistant", reasoning_content: "first " })));
@@ -787,7 +910,7 @@ Deno.test("deepseek responses: stream translator accumulates fragmented tool cal
   ]);
   const done = events.find((event) => event.type === "response.output_item.done") as { item: Record<string, unknown> };
   assert.deepEqual(done.item, {
-    id: "resp_tools_fc_0",
+    id: "fc_resp_tools_0",
     type: "function_call",
     status: "completed",
     call_id: "call_1",
@@ -796,13 +919,12 @@ Deno.test("deepseek responses: stream translator accumulates fragmented tool cal
   });
 });
 
-Deno.test("deepseek responses: an argument-only tool-call delta is observed but not answer-bearing", () => {
+Deno.test("deepseek responses: an argument-only tool-call delta is not answer-bearing", () => {
   const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_partial_call", echo, 1_780_000_000);
   translator.push(chatChunk({ content: "Step 11 of 16 complete." }));
   translator.push(chatChunk({ tool_calls: [{ index: 0, function: { arguments: '{"path":' } }] }, { finish_reason: "stop" }));
-  // The two predicates are distinct: the nameless partial delta owns a tool-call
-  // slot but answers nothing, so only the observed count refuses the recheck.
-  assert.equal(translator.observedToolCallCount(), 1);
+  // A nameless argument-only delta answers nothing: it carries no tool name, so
+  // the answer-bearing contract reports zero named tool calls.
   // The refusal field is part of the answer-bearing contract; an unrefused
   // answer reports it as the empty string.
   assert.deepEqual(translator.answerBearingOutput(), { text: "Step 11 of 16 complete.", refusal: "", toolCallCount: 0 });
@@ -1010,6 +1132,55 @@ Deno.test("deepseek responses: a truncated stream reports response.incomplete in
   );
 });
 
+Deno.test("deepseek responses: a length-truncated tool call closes incomplete before the terminal", () => {
+  // A `length` stop can land mid-arguments. Closing the item as `completed`
+  // before the `response.incomplete` terminal hands a status-aware consumer a
+  // partial call it may execute, so the terminal disposition is decided first
+  // and both tool kinds carry the official non-completed status in the done
+  // event and in the delivered output.
+  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_len_tool", echo, 1_780_000_000, new Map(), new Set(["exec"]));
+  const events: Record<string, unknown>[] = [];
+  events.push(
+    ...translator.push(
+      chatChunk(
+        {
+          role: "assistant",
+          tool_calls: [
+            { index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: '{"cmd":"echo hi' } },
+            { index: 1, id: "call_2", type: "function", function: { name: "exec", arguments: '{"input":"print(' } },
+          ],
+        },
+        { finish_reason: "length" }
+      )
+    )
+  );
+  events.push(...translator.finish());
+
+  const doneIndexes = events.flatMap((event, index) => (event.type === "response.output_item.done" ? [index] : []));
+  assert.equal(doneIndexes.length, 2);
+  const itemDones = doneIndexes.map((index) => events[index] as { item: Record<string, unknown> });
+  assert.deepEqual(
+    itemDones.map((done) => done.item),
+    [
+      { id: "fc_resp_len_tool_0", type: "function_call", status: "incomplete", call_id: "call_1", name: "shell", arguments: '{"cmd":"echo hi' },
+      { id: "ctc_resp_len_tool_1", type: "custom_tool_call", status: "incomplete", call_id: "call_2", name: "exec", input: '{"input":"print(' },
+    ]
+  );
+  // The terminal output carries the exact items the done events announced, and
+  // every item closes before the terminal it now agrees with.
+  const terminal = events.at(-1) as { type: string; response: Record<string, unknown> };
+  assert.equal(terminal.type, "response.incomplete");
+  assert.deepEqual(
+    terminal.response.output,
+    itemDones.map((done) => done.item)
+  );
+  assert.equal(doneIndexes[1] < events.length - 1, true);
+  assert.equal(
+    events.some((event) => event.type === "response.completed"),
+    false
+  );
+});
+
 Deno.test("deepseek responses: a provider interruption is a failed terminal, not a completion", () => {
   for (const [reason, code] of [
     ["insufficient_system_resource", "insufficient_system_resource"],
@@ -1065,197 +1236,116 @@ Deno.test("deepseek responses: a normal stream is still reported as completed", 
   assert.equal(terminal.response.error, null);
 });
 
-Deno.test("deepseek responses: the bounded recheck runs only for a measured tool-bearing progress stop", () => {
-  const firstLeg: {
-    finishReason: string;
-    text: string;
-    refusal: string;
-    toolCallCount: number;
-    executableToolCount: number;
-    toolChoice: unknown;
-    firstCompletionTokens: number | null;
-    allowance: number | null;
-  } = {
-    finishReason: "stop",
-    text: "Step 11 of 16 complete.",
-    refusal: "",
-    toolCallCount: 0,
-    executableToolCount: 2,
-    toolChoice: "auto",
-    firstCompletionTokens: 10,
-    allowance: 512,
+Deno.test("deepseek responses: bounds oversized forwarded payloads under the declared policy", () => {
+  const limit = FORWARDED_PAYLOAD_POLICY.perMessageLimit;
+  const messages = (result: ReturnType<typeof toDeepSeekChatMessages>): Record<string, unknown>[] => {
+    if (!result.ok) throw new Error(`unexpected projection failure: ${result.message}`);
+    return result.value;
   };
-  const eligible = deepSeekRecheckEligibility(firstLeg);
-  assert.equal(eligible.eligible, true);
-  assert.equal(eligible.remainingBudget, 502);
-  assert.equal(eligible.maxTokens, 502);
-  // The recheck may add at most 8,192 tokens; a known allowance that is larger
-  // still bounds the two legs together, so the cap never widens the caller's ask.
-  const capped = deepSeekRecheckEligibility({ ...firstLeg, firstCompletionTokens: 100, allowance: 20_000 });
-  assert.equal(capped.eligible, true);
-  assert.equal(capped.remainingBudget, 19_900);
-  assert.equal(capped.maxTokens, DEEPSEEK_RECHECK_MAX_TOKENS);
-  // Real Codex `high`/`max` traffic omits `max_output_tokens`, so the gateway
-  // knows no original cap. That is not a zero budget: the one advisory recheck
-  // is still allowed, bounded only by the recheck's own 8,192-token ceiling,
-  // and no aggregate remaining allowance is claimed.
-  const uncapped = deepSeekRecheckEligibility({ ...firstLeg, allowance: null });
-  assert.equal(uncapped.eligible, true);
-  assert.equal(uncapped.remainingBudget, null);
-  assert.equal(uncapped.maxTokens, DEEPSEEK_RECHECK_MAX_TOKENS);
-  const skipped: { name: string; facts: typeof firstLeg; reason: DeepSeekRecheckSkipReason }[] = [
-    { name: "a truncation", facts: { ...firstLeg, finishReason: "length" }, reason: "finish_reason" },
-    { name: "an interruption", facts: { ...firstLeg, finishReason: "insufficient_system_resource" }, reason: "finish_reason" },
-    { name: "a refusal", facts: { ...firstLeg, refusal: "I cannot help with that." }, reason: "refusal" },
-    { name: "an empty answer", facts: { ...firstLeg, text: "" }, reason: "empty_text" },
-    { name: "a first-leg tool call", facts: { ...firstLeg, toolCallCount: 1 }, reason: "tool_calls" },
-    { name: "no executable tools", facts: { ...firstLeg, executableToolCount: 0 }, reason: "no_executable_tools" },
-    { name: "tool_choice none", facts: { ...firstLeg, toolChoice: "none" }, reason: "tool_choice" },
-    { name: "tool_choice required", facts: { ...firstLeg, toolChoice: "required" }, reason: "tool_choice" },
+
+  // A single tool result larger than the per-message bound is cut, not forwarded
+  // whole: the provider counts it as text tokens and one such result took a live
+  // session past the 1,048,576-token window on 2026-09-24. The reduction is
+  // visible - the marker names the declared policy version and says the model
+  // did not receive the elided bytes - and the forwarded content stays inside
+  // the declared limit.
+  const oversized = "x".repeat(limit + 1_024);
+  const bounded = messages(
+    toDeepSeekChatMessages(
+      [
+        { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+        { type: "function_call_output", call_id: "call_big", output: oversized },
+      ],
+      null
+    )
+  );
+  const toolContent = (bounded.at(-1) as { content: string }).content;
+  assert.equal(toolContent.length < oversized.length, true);
+  assert.equal(toolContent.includes("bytes omitted"), true);
+  assert.equal(toolContent.includes(FORWARDED_PAYLOAD_POLICY.version), true);
+  assert.equal(toolContent.includes("the model did not receive the elided bytes"), true);
+  assert.equal(new TextEncoder().encode(toolContent).byteLength <= limit, true);
+
+  // Payloads inside the bound are untouched, so ordinary tool results replay verbatim.
+  const verbatim = messages(toDeepSeekChatMessages([{ type: "function_call_output", call_id: "call_small", output: "2026-09-16" }], null));
+  assert.deepEqual(verbatim.at(-1), { role: "tool", tool_call_id: "call_small", content: "2026-09-16" });
+
+  // An oversized image data URL is dropped rather than cut (half a base64
+  // payload is not an image) and the omission marker says the model did not
+  // receive the image, while an ordinary data URL still forwards as an image.
+  const hugeImage = `data:image/png;base64,${"A".repeat(limit + 10)}`;
+  const dropped = messages(toDeepSeekChatMessages([{ type: "message", role: "user", content: [{ type: "input_image", image_url: hugeImage }] }], null));
+  const droppedContent = (dropped.at(-1) as { content: unknown }).content;
+  assert.equal(typeof droppedContent, "string");
+  assert.equal(String(droppedContent).includes("image omitted"), true);
+  assert.equal(String(droppedContent).includes(FORWARDED_PAYLOAD_POLICY.version), true);
+  assert.equal(String(droppedContent).includes("the model did not receive this image"), true);
+
+  const smallImage = "data:image/png;base64,AQID";
+  const kept = messages(toDeepSeekChatMessages([{ type: "message", role: "user", content: [{ type: "input_image", image_url: smallImage }] }], null));
+  assert.deepEqual((kept.at(-1) as { content: unknown }).content, [{ type: "image_url", image_url: { url: smallImage } }]);
+
+  // An explicit `truncation: "disabled"` fails closed instead of reducing: the
+  // error names the input path, the byte counts and the declared limit, and it
+  // is recoverable without re-deriving which item was too large.
+  const refused = toDeepSeekResponsesChatBody(
     {
-      name: "a named tool_choice",
-      facts: { ...firstLeg, toolChoice: { type: "function", function: { name: "read_file" } } },
-      reason: "tool_choice",
+      input: [
+        { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+        { type: "function_call_output", call_id: "call_big", output: oversized },
+      ],
+      truncation: "disabled",
     },
-    { name: "an unobserved first usage", facts: { ...firstLeg, firstCompletionTokens: null }, reason: "usage_unknown" },
-    { name: "a non-finite allowance", facts: { ...firstLeg, allowance: Number.POSITIVE_INFINITY }, reason: "budget_unknown" },
-    { name: "no remaining budget", facts: { ...firstLeg, firstCompletionTokens: 512 }, reason: "budget_exhausted" },
-    { name: "an exhausted budget", facts: { ...firstLeg, firstCompletionTokens: 600 }, reason: "budget_exhausted" },
-  ];
-  for (const testCase of skipped) {
-    const result = deepSeekRecheckEligibility(testCase.facts);
-    assert.equal(result.eligible, false, testCase.name);
-    assert.equal(result.reason, testCase.reason, testCase.name);
+    "deepseek-flash",
+    false
+  );
+  if (refused.ok) throw new Error("expected a fail-closed projection");
+  assert.equal(refused.code, "context_length_exceeded");
+  assert.equal(refused.param, "input[1].output");
+  assert.equal(refused.message.includes(`carries ${oversized.length} bytes`), true);
+  assert.equal(refused.message.includes(`at most ${limit} bytes per message under ${FORWARDED_PAYLOAD_POLICY.version}`), true);
+  assert.equal(refused.message.includes("truncation 'disabled'"), true);
+
+  // The request path records every reduction for the operator log, and the
+  // absent field or an explicit `"auto"` keep the declared bounded policy.
+  const elisionBody = (truncation: unknown) =>
+    toDeepSeekResponsesChatBody(
+      {
+        input: [
+          { type: "function_call", name: "read_file", arguments: "{}", call_id: "call_big" },
+          { type: "function_call_output", call_id: "call_big", output: oversized },
+          { type: "message", role: "user", content: [{ type: "input_image", image_url: hugeImage }] },
+        ],
+        ...(truncation === undefined ? {} : { truncation }),
+      },
+      "deepseek-flash",
+      false
+    );
+  for (const truncation of [undefined, "auto"]) {
+    const translated = elisionBody(truncation);
+    if (!translated.ok) throw new Error("expected a bounded projection");
+    assert.equal(translated.value.elisions.length, 2);
+    const [toolElision, imageElision] = translated.value.elisions;
+    assert.deepEqual(
+      Object.keys(toolElision).sort((a, b) => a.localeCompare(b)),
+      ["callId", "forwardedBytes", "kind", "omittedBytes", "originalBytes", "path"]
+    );
+    assert.equal(toolElision.path, "input[1].output");
+    assert.equal(toolElision.callId, "call_big");
+    assert.equal(toolElision.kind, "tool_output");
+    assert.equal(toolElision.originalBytes, new TextEncoder().encode(oversized).byteLength);
+    assert.equal(toolElision.forwardedBytes <= limit, true);
+    assert.equal(toolElision.omittedBytes > 0, true);
+    assert.equal(imageElision.path, "input[2].content[0]");
+    assert.equal(imageElision.callId, null);
+    assert.equal(imageElision.kind, "image");
+    assert.equal(imageElision.originalBytes, new TextEncoder().encode(hugeImage).byteLength);
+    assert.equal(imageElision.omittedBytes, new TextEncoder().encode(hugeImage).byteLength);
   }
-});
 
-Deno.test("deepseek responses: the recheck request appends the draft and never forces a tool", () => {
-  const firstLeg = toDeepSeekResponsesChatBody(
-    {
-      instructions: "Be terse.",
-      input: "read all 16 files",
-      max_output_tokens: 512,
-      reasoning: { effort: "max" },
-      tools: [{ type: "function", name: "read_file", parameters: { type: "object" } }],
-      tool_choice: "auto",
-    },
-    "deepseek-v4-flash",
-    true
-  );
-  assert.equal(firstLeg.ok, true);
-  const first = firstLeg.value.body;
-  const recheck = toDeepSeekRecheckChatBody(first, { content: "Step 11 of 16 complete.", reasoning: "I read ten files." }, 502);
-  // Only the recheck is buffered; the first generation stayed progressive.
-  assert.equal(recheck.stream, false);
-  assert.equal("stream_options" in recheck, false);
-  assert.equal(recheck.max_tokens, 502);
-  assert.equal(recheck.model, first.model);
-  assert.equal(recheck.reasoning_effort, first.reasoning_effort);
-  assert.equal(recheck.tool_choice, "auto");
-  assert.deepEqual(recheck.tools, first.tools);
-  const messages = recheck.messages as Record<string, unknown>[];
-  assert.deepEqual(messages.slice(0, -2), first.messages);
-  assert.deepEqual(messages.slice(-2), [
-    { role: "assistant", content: "Step 11 of 16 complete.", reasoning_content: "I read ten files." },
-    { role: "user", content: DEEPSEEK_RECHECK_INSTRUCTION },
-  ]);
-});
-
-Deno.test("deepseek responses: a recheck tool call must name an advertised executable tool", () => {
-  const executableNames = new Set(["read_file", "clock_now"]);
-  const call = { id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } };
-  assert.deepEqual(deepSeekRecheckToolCalls({ tool_calls: [call] }, executableNames), [call]);
-  assert.equal(deepSeekRecheckToolCalls({ tool_calls: [] }, executableNames), null);
-  assert.equal(deepSeekRecheckToolCalls({}, executableNames), null);
-  // A hidden or aliased tool the client never offered is rejected as a batch.
-  assert.equal(
-    deepSeekRecheckToolCalls({ tool_calls: [{ id: "call_2", type: "function", function: { name: "hidden_tool", arguments: "{}" } }] }, executableNames),
-    null
-  );
-  assert.equal(
-    deepSeekRecheckToolCalls({ tool_calls: [call, { id: "call_2", type: "function", function: { name: "hidden_tool", arguments: "{}" } }] }, executableNames),
-    null
-  );
-});
-
-Deno.test("deepseek responses: recheck usage sums both legs and never invents a missing one", () => {
-  const first = {
-    prompt_tokens: 100,
-    completion_tokens: 10,
-    total_tokens: 110,
-    prompt_tokens_details: { cached_tokens: 40 },
-    completion_tokens_details: { reasoning_tokens: 4 },
-  };
-  const second = {
-    prompt_tokens: 120,
-    completion_tokens: 6,
-    total_tokens: 126,
-    prompt_tokens_details: { cached_tokens: 50 },
-    completion_tokens_details: { reasoning_tokens: 1 },
-  };
-  assert.deepEqual(mergeDeepSeekRecheckUsage(first, second), {
-    usage: {
-      prompt_tokens: 220,
-      completion_tokens: 16,
-      total_tokens: 236,
-      prompt_tokens_details: { cached_tokens: 90 },
-      completion_tokens_details: { reasoning_tokens: 5 },
-    },
-    complete: true,
-  });
-  // A wholly unobserved second leg keeps the first leg's measured base counters
-  // and adds no aggregate detail, because the second leg never measured one.
-  assert.deepEqual(mergeDeepSeekRecheckUsage(first, null), {
-    usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
-    complete: false,
-  });
-  assert.deepEqual(mergeDeepSeekRecheckUsage(first, "not usage"), {
-    usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
-    complete: false,
-  });
-  // A partial second leg keeps every counter either leg measured: the measured
-  // first-leg input survives the missing second-leg one, the completion counter
-  // is the sum of both measured amounts, and the reported total is raised to the
-  // consistent lower bound, the sum of those observed components.
-  assert.deepEqual(mergeDeepSeekRecheckUsage(first, { completion_tokens: 5 }), {
-    usage: { prompt_tokens: 100, completion_tokens: 15, total_tokens: 115 },
-    complete: false,
-  });
-  // A total-only second measurement is kept as reported even when it exceeds the
-  // partial input and output components, which are never dropped or reduced.
-  assert.deepEqual(mergeDeepSeekRecheckUsage({ prompt_tokens: 100, completion_tokens: 10 }, { total_tokens: 500 }), {
-    usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 500 },
-    complete: false,
-  });
-  // A base counter only the second leg measured still counts, and a reported
-  // total below the observed components is raised to cover them.
-  assert.deepEqual(mergeDeepSeekRecheckUsage({ completion_tokens: 10 }, { prompt_tokens: 120, total_tokens: 126 }), {
-    usage: { prompt_tokens: 120, completion_tokens: 10, total_tokens: 130 },
-    complete: false,
-  });
-  // A detail one leg never measured stays absent: unmeasured is never zero, and
-  // the base counters still sum.
-  assert.deepEqual(mergeDeepSeekRecheckUsage(first, { prompt_tokens: 120, completion_tokens: 6, total_tokens: 126 }), {
-    usage: { prompt_tokens: 220, completion_tokens: 16, total_tokens: 236 },
-    complete: true,
-  });
-  assert.deepEqual(
-    mergeDeepSeekRecheckUsage(first, { prompt_tokens: 120, completion_tokens: 6, total_tokens: 126, prompt_tokens_details: { cached_tokens: 50 } }),
-    { usage: { prompt_tokens: 220, completion_tokens: 16, total_tokens: 236, prompt_tokens_details: { cached_tokens: 90 } }, complete: true }
-  );
-  assert.deepEqual(mergeDeepSeekRecheckUsage(null, second), { usage: null, complete: false });
-  // A rejected second completion keeps a usage object with a measurable counter
-  // and never invents one out of nothing.
-  const partialSecondUsage = { completion_tokens: 5 };
-  assert.equal(measurableDeepSeekRecheckUsage(partialSecondUsage), partialSecondUsage);
-  assert.equal(measurableDeepSeekRecheckUsage({}), null);
-  assert.equal(measurableDeepSeekRecheckUsage({ prompt_tokens: -1 }), null);
-  assert.equal(measurableDeepSeekRecheckUsage(null), null);
-});
-
-Deno.test("deepseek responses: the translator exposes the first-leg draft the recheck appends", () => {
-  const translator = createDeepSeekResponsesStreamTranslator("deepseek-flash", "resp_draft", echo, 1_780_000_000);
-  translator.push(chatChunk({ role: "assistant", reasoning_content: "I read ten files." }));
-  translator.push(chatChunk({ content: "Step 11 of 16 complete." }, { finish_reason: "stop" }));
-  assert.deepEqual(translator.draftAssistantMessage(), { content: "Step 11 of 16 complete.", reasoning: "I read ten files." });
+  // Any other truncation value is rejected rather than guessed at.
+  const bogus = toDeepSeekResponsesChatBody({ input: "hi", truncation: "sometimes" }, "deepseek-flash", false);
+  if (bogus.ok) throw new Error("expected an unsupported-value failure");
+  assert.equal(bogus.param, "truncation");
+  assert.equal(bogus.code, undefined);
 });

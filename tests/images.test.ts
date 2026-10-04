@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { STANDARD_RATE_LIMIT_HEADERS } from "../src/http.ts";
 import { MAX_ACCEPTED_JSON_BODY_BYTES } from "../src/request.ts";
-import { captureAcceptedSentinelReplayInput, materializeSentinelReplayInput, zeroSentinelReplayInput } from "../src/sentinel_replay_capture.ts";
+import { captureAcceptedSentinelReplayInput, materializeSentinelReplayInput, zeroSentinelReplayInput } from "../src/sentinel/replay-capture.ts";
 import {
   buildImageResponsesRequest,
   createImageFanoutDispatchCoordinator,
   extractImagesFromResponses,
   handleImages,
   setImageBaseModelForTest,
-} from "../src/openai.ts";
+} from "../src/images.ts";
 
 /** Pin the tool host so the suite never depends on ambient deployment config. */
 const withBaseModel = async (model: string, run: () => Promise<void>): Promise<void> => {
