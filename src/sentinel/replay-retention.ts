@@ -242,7 +242,7 @@ type PublishAttemptContext = Readonly<{
   /** Net record and byte movement of the status row this attempt replaces. */
   statusRecordsDelta: number;
   statusBytesDelta: number;
-  nowMs: number;
+  leaseNowMs: number;
 }>;
 
 /**
@@ -277,7 +277,7 @@ const publishAttemptRow = (
   const row = entry.value;
   if (row.state !== "reserved") return null;
   if (row.fence !== context.accounting.fence) return null;
-  if (row.expires_at_ms <= context.nowMs) return null;
+  if (row.expires_at_ms <= context.leaseNowMs) return null;
   if (row.created_at_ms !== context.accounting.created_at_ms) return null;
   if (!Number.isSafeInteger(context.actualCharge) || context.actualCharge <= 0) return null;
   if (context.actualCharge > row.bytes) return null;
@@ -300,7 +300,15 @@ export const prepareSentinelReplayPublication = async (
   accounting: SentinelReplayAccountingRow,
   accountingKey: Deno.KvKey,
   actualCharge: number,
-  options: Readonly<{ now_ms: number; status_key: Deno.KvKey; status_bytes?: number; budget_bytes?: number }>
+  options: Readonly<{
+    /** Frozen capture time used to keep published expiry aligned with the manifest. */
+    now_ms: number;
+    /** Fresh wall-clock time used only to validate the reservation lease. */
+    lease_now_ms: number;
+    status_key: Deno.KvKey;
+    status_bytes?: number;
+    budget_bytes?: number;
+  }>
 ): Promise<SentinelReplayPublication | null> => {
   const budgetBytes = Math.max(64 * 1_024, Math.trunc(options.budget_bytes ?? sentinelReplayBudgetBytes()));
   const payloadBudget = sentinelReplayPayloadBudgetBytes(budgetBytes);
@@ -327,7 +335,7 @@ export const prepareSentinelReplayPublication = async (
       reserve,
       statusRecordsDelta,
       statusBytesDelta,
-      nowMs: options.now_ms,
+      leaseNowMs: options.lease_now_ms,
     });
     if (row === null) return null;
     const stored = ledger.stored_bytes + actualCharge;

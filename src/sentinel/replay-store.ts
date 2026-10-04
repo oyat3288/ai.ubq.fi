@@ -489,7 +489,8 @@ const storeReplayEnvelope = async (
         expiresAtMs: manifest.expires_at_ms,
       });
       const publication = await prepareSentinelReplayPublication(dependencies.kv, context.accounting, context.accountingKey, context.actualCharge, {
-        now_ms: currentNow(),
+        now_ms: now,
+        lease_now_ms: currentNow(),
         status_key: requestStatusKey(context.requestId),
         status_bytes: sentinelReplayStatusMetadataBytes(statusRow),
         budget_bytes: dependencies.budgetBytes,

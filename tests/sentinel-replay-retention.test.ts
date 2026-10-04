@@ -569,6 +569,7 @@ Deno.test({
       assert.deepEqual(resumed, { ok: false, reason: "revoked" });
       const publication = await prepareSentinelReplayPublication(kv, admission.accounting, key, 1_000, {
         now_ms: now,
+        lease_now_ms: now,
         status_key: sentinelReplayRequestStatusKey("paused-writer"),
         budget_bytes: TEST_BUDGET_BYTES,
       });
