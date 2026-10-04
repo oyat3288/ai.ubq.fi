@@ -395,6 +395,7 @@ const handleTerminalRoute = async (
         route,
         telemetryResponse: response,
         startedAtMonotonicMs: requestStartedAtMonotonicMs,
+        requestStartedAtMs,
         requestId,
         onTerminal: trackKernelTerminal ? settleKernelQuota : undefined,
         onSettled: releaseProcessPermit,

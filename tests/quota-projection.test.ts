@@ -182,7 +182,8 @@ const {
   paidFallbackRequestV3Key,
   paidFallbackWindowV3Key,
 } = await import("../src/paid-fallback/ledger-state.ts");
-const { listPaidFallbackUsageRollups, mergePaidFallbackUsageRollup, paidFallbackUsageRollupKey } = await import("../src/paid-fallback/rollups.ts");
+const { listPaidFallbackUsageRollups, mergePaidFallbackUsageRollup, paidFallbackUsageRollupKey, recordTerminalUsageRollup } =
+  await import("../src/paid-fallback/rollups.ts");
 const {
   METERED_QUOTA_BALANCE_HISTORY_DAILY_BUCKET_MS,
   METERED_QUOTA_BALANCE_HISTORY_PREFIX,
@@ -505,6 +506,188 @@ Deno.test("merge sums counters and tracks first/last request times", () => {
   assert.equal(second.cached_input_tokens, 7);
   assert.equal(second.first_request_at_ms, 4_000);
   assert.equal(second.last_request_at_ms, 5_000);
+});
+
+Deno.test("terminal observations record subscription usage and skip settled providers", async () => {
+  memoryKv.entries.clear();
+  const now = Date.now();
+  const observation = {
+    model: "gpt-5.6-sol",
+    provider: "chatgpt_codex",
+    request_created_at_ms: now,
+    input_tokens: 120,
+    cached_input_tokens: 40,
+    output_tokens: 30,
+  } as const;
+
+  assert.equal(await recordTerminalUsageRollup({ ...observation, request_id: "terminal-codex-a" }, kv), true);
+  assert.equal(await recordTerminalUsageRollup({ ...observation, request_id: "terminal-codex-b" }, kv), true);
+  // Settled providers already contribute their authoritative settlement row.
+  assert.equal(await recordTerminalUsageRollup({ ...observation, provider: "metered", request_id: "terminal-metered" }, kv), false);
+  assert.equal(await recordTerminalUsageRollup({ ...observation, provider: "surplus", request_id: "terminal-surplus" }, kv), false);
+  // A gateway rejection and an image-fanout aggregate are labels, not routes.
+  assert.equal(await recordTerminalUsageRollup({ ...observation, provider: "gateway", request_id: "terminal-gateway" }, kv), false);
+  assert.equal(await recordTerminalUsageRollup({ ...observation, provider: "mixed", request_id: "terminal-mixed" }, kv), false);
+  assert.equal(await recordTerminalUsageRollup({ ...observation, model: null, request_id: "terminal-model-unknown" }, kv), false);
+  // An unavailable KV never throws on the terminal path.
+  assert.equal(await recordTerminalUsageRollup({ ...observation, request_id: "terminal-no-kv" }, null), false);
+
+  const rollups = await listPaidFallbackUsageRollups(kv, { sinceMs: now - 30 * DAY_MS, nowMs: now });
+  const subscription = rollups.filter((entry) => entry.provider === "chatgpt_codex");
+  assert.ok(subscription.length >= 1, "terminal observations must land in the hourly rollup");
+  const sum = (key: "request_count" | "input_tokens" | "cached_input_tokens" | "output_tokens" | "quota_sum" | "spend_microcredits") =>
+    subscription.reduce((total, entry) => total + entry[key], 0);
+  assert.equal(sum("request_count"), 2);
+  assert.equal(sum("input_tokens"), 240);
+  assert.equal(sum("cached_input_tokens"), 80);
+  assert.equal(sum("output_tokens"), 60);
+  assert.equal(sum("quota_sum"), 0);
+  assert.equal(sum("spend_microcredits"), 0);
+  const bucketStartAtMs = Math.floor(now / HOUR_MS) * HOUR_MS;
+  for (const entry of subscription) {
+    assert.equal(entry.model, "gpt-5.6-sol");
+    assert.equal(entry.bucket_start_at_ms, bucketStartAtMs);
+  }
+});
+
+Deno.test("terminal observations skip unobserved usage instead of recording zero-token rows", async () => {
+  memoryKv.entries.clear();
+  const now = Date.now();
+  assert.equal(
+    await recordTerminalUsageRollup(
+      {
+        model: "gpt-5.6-sol",
+        provider: "chatgpt_codex",
+        request_id: "terminal-unobserved",
+        request_created_at_ms: now,
+        input_tokens: null,
+        cached_input_tokens: null,
+        output_tokens: null,
+      },
+      kv
+    ),
+    false
+  );
+  // A partial observation is missing a core dimension, so it is not recorded
+  // as a zero either.
+  assert.equal(
+    await recordTerminalUsageRollup(
+      {
+        model: "gpt-5.6-sol",
+        provider: "chatgpt_codex",
+        request_id: "terminal-partial",
+        request_created_at_ms: now,
+        input_tokens: 10,
+        cached_input_tokens: null,
+        output_tokens: null,
+      },
+      kv
+    ),
+    false
+  );
+  const rollups = await listPaidFallbackUsageRollups(kv, { sinceMs: now - DAY_MS, nowMs: now });
+  assert.equal(rollups.length, 0, "an unobserved response must not create a zero-token rollup row");
+});
+
+Deno.test("terminal observations retry a conflicting shard write instead of dropping it", async () => {
+  memoryKv.entries.clear();
+  const now = Date.now();
+  memoryKv.atomicConflictOnce = true;
+  const recorded = await recordTerminalUsageRollup(
+    {
+      model: "gpt-5.6-luna",
+      provider: "cerebras",
+      request_id: "terminal-cas-retry",
+      request_created_at_ms: now,
+      input_tokens: 11,
+      cached_input_tokens: null,
+      output_tokens: 3,
+    },
+    kv
+  );
+  assert.equal(recorded, true);
+  const rollups = await listPaidFallbackUsageRollups(kv, { sinceMs: now - DAY_MS, nowMs: now });
+  const recordedCount = rollups.filter((entry) => entry.provider === "cerebras").reduce((total, entry) => total + entry.request_count, 0);
+  assert.equal(recordedCount, 1);
+});
+
+Deno.test("subscription observations join the projection without runway estimates", async () => {
+  memoryKv.entries.clear();
+  const now = Date.now();
+  await recordTerminalUsageRollup(
+    {
+      model: "gpt-5.6-sol",
+      provider: "chatgpt_codex",
+      request_id: "terminal-projection",
+      request_created_at_ms: now,
+      input_tokens: 50,
+      cached_input_tokens: null,
+      output_tokens: 20,
+    },
+    kv
+  );
+  const rollups = await listPaidFallbackUsageRollups(kv, { sinceMs: now - DAY_MS, nowMs: now });
+  const usage = summarizePaidFallbackUsage(groupPaidFallbackUsageRollups(rollups), now);
+  const subscription = usage.find((entry) => entry.provider === "chatgpt_codex");
+  assert.ok(subscription, "the subscription provider must be part of the projection");
+  const window = subscription.windows.find((candidate) => candidate.window_days === 30);
+  assert.equal(window?.request_count, 1);
+  assert.equal(window.input_tokens, 50);
+  assert.equal(window.quota_sum, 0);
+  // Nothing in an observability row can be projected against the OpenLux balance.
+  assert.deepEqual(projectPaidFallbackRunway(subscription, meteredQuotaRunwayView(null), now), []);
+});
+
+Deno.test("admin projection tags settled rows paid_fallback and terminal accounting observability", async () => {
+  await withMeteredEnv(async () => {
+    memoryKv.entries.clear();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.reject(new Error("offline projection test"));
+    try {
+      const now = Date.now();
+      const bucketStartAtMs = Math.floor(now / HOUR_MS) * HOUR_MS;
+      const settled: PaidFallbackUsageRollup = {
+        v: 1,
+        bucket_start_at_ms: bucketStartAtMs,
+        model: "gpt-5.6-sol",
+        provider: "metered",
+        request_count: 1,
+        quota_sum: 50,
+        input_tokens: 100,
+        cached_input_tokens: 0,
+        output_tokens: 10,
+        spend_microcredits: 25,
+        first_request_at_ms: now,
+        last_request_at_ms: now,
+        updated_at_ms: now,
+      };
+      await memoryKv.set(paidFallbackUsageRollupKey(bucketStartAtMs, "gpt-5.6-sol", "metered", 0), settled);
+      assert.equal(
+        await recordTerminalUsageRollup(
+          {
+            model: "gpt-5.6-sol",
+            provider: "chatgpt_codex",
+            request_id: "terminal-usage-source",
+            request_created_at_ms: now,
+            input_tokens: 40,
+            cached_input_tokens: null,
+            output_tokens: 5,
+          },
+          kv
+        ),
+        true
+      );
+      const { handleAdminProvidersQuotaProjection } = await import("../src/admin/kernel.ts");
+      const response = await handleAdminProvidersQuotaProjection(new Request("https://ai.ubq.fi/admin/providers/quota-projection?window_days=30"));
+      assert.equal(response.status, 200);
+      const payload = (await response.json()) as { models?: { provider?: string; usage_source?: string }[] };
+      const usageSourceByProvider = new Map((payload.models ?? []).map((row) => [row.provider, row.usage_source]));
+      assert.equal(usageSourceByProvider.get("metered"), "paid_fallback");
+      assert.equal(usageSourceByProvider.get("chatgpt_codex"), "observability");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
 
 Deno.test("summarize and project offer per-window rates and exhaustion estimates", () => {

@@ -6,6 +6,7 @@ import { scheduleSentinelBackgroundTask, shouldSignalSentinelProviderDegradation
 import { recordAdminError } from "../admin/error-log.ts";
 import { runtimeDeploymentId, runtimeGitSha } from "../config.ts";
 import { getResponseAccountCohortId, getResponseTelemetry } from "../openai-telemetry.ts";
+import { recordTerminalUsageRollup } from "../paid-fallback/rollups.ts";
 import { enqueuePromptCacheAnalytics, recordPromptCacheAnalytics } from "../cache/prompt-analytics.ts";
 import { recordPromptCacheTelemetry } from "../cache/telemetry-gate.ts";
 import {
@@ -44,6 +45,10 @@ const logTerminalRequest = async (
     suppressSentinelReplay?: boolean;
     /** Time this request spent waiting for a process-resource permit, if it queued. */
     admissionWaitMs?: number | null;
+    /** Wall-clock request start, used to bucket the terminal usage rollup. */
+    requestStartedAtMs?: number;
+    /** Test seam for proving terminal usage accounting stays best effort. */
+    recordUsageRollup?: typeof recordTerminalUsageRollup;
     resolveClientBodyObservation?: () => SentinelClientBodyObservation | null | Promise<SentinelClientBodyObservation | null>;
   }>
 ): Promise<void> => {
@@ -143,6 +148,23 @@ const logTerminalRequest = async (
     fallbackReason: terminal.fallback_reason,
   };
   const cacheAnalyticsWrite = input.recordCacheAnalytics ? input.recordCacheAnalytics(cacheAnalyticsEvent) : enqueuePromptCacheAnalytics(cacheAnalyticsEvent);
+  // All-route model accounting fills the gap the paid ledger cannot see: a
+  // Codex-subscription response never reaches settlement, so its usage would be
+  // missing from the projection. It costs one bounded strong read plus one
+  // compare-and-set merge per terminal response on the routes the writer does
+  // not skip, and that deliberate cost is recorded in
+  // tests/usage-optimization-measurement.test.ts. Settled paid providers and
+  // responses that never observed their usage are skipped by the writer, and a
+  // KV failure never changes an already-terminal response.
+  const usageRollupWrite = (input.recordUsageRollup ?? recordTerminalUsageRollup)({
+    model: terminal.model,
+    provider: terminal.provider,
+    request_id: input.requestId,
+    request_created_at_ms: input.requestStartedAtMs ?? Date.now(),
+    input_tokens: terminal.input_tokens,
+    cached_input_tokens: terminal.cached_input_tokens,
+    output_tokens: terminal.output_tokens,
+  }).catch(() => false);
   const replayObservation: SentinelFailureObservation = {
     status: terminal.status,
     stream: terminal.stream,
@@ -182,7 +204,7 @@ const logTerminalRequest = async (
       git_sha: terminal.git_sha,
       deno_revision: terminal.deno_revision,
     });
-    await Promise.all([telemetryWrite, cacheAnalyticsWrite, replayWrite, degradationWrite, adminErrorWrite]);
+    await Promise.all([telemetryWrite, cacheAnalyticsWrite, replayWrite, degradationWrite, adminErrorWrite, usageRollupWrite]);
   } finally {
     zeroSentinelReplayInput(input.sentinelReplayInput);
   }
@@ -245,6 +267,10 @@ export const withTerminalRequestLog = (
     deliverySignal?: AbortSignal;
     /** Time this request spent waiting for a process-resource permit, if it queued. */
     admissionWaitMs?: number | null;
+    /** Wall-clock request start, used to bucket the terminal usage rollup. */
+    requestStartedAtMs?: number;
+    /** Test seam for proving terminal usage accounting stays best effort. */
+    recordUsageRollup?: typeof recordTerminalUsageRollup;
     /** Test seam for proving aggregate cache analytics remains best effort. */
     recordCacheAnalytics?: typeof recordPromptCacheAnalytics;
     /** Test seam for proving terminal telemetry remains best effort. */

@@ -356,10 +356,38 @@ Deno.test("usage optimization fixture records per-auth KV commands, atomic commi
     assert.ok(uosSuccess.commands > 0, "UOS allowlist activity must remain measurable");
     assert.ok(adminSuccess.commands > 0, "admin allowlist activity must remain measurable");
     assert.equal(retry.serialized_request_bytes, bytes(JSON.stringify(retryBody)) * 2);
+    // The terminal usage rollup is deliberate per-response observability
+    // accounting for routes the paid ledger never sees (the Codex subscription
+    // path here): one bounded strong read plus one compare-and-set merge for a
+    // response whose usage was observed. It is recorded here instead of
+    // absorbed.
+    const usageRollupCommandsFor = (scenario: string) =>
+      kv.commands.filter(
+        (record) => record.scenario === scenario && record.keys.some((key) => key[0] === "uos_ai" && key[1] === "paid_fallback" && key[3] === "usage_rollup")
+      );
+    const boundedUsageRollupCommands = usageRollupCommandsFor("bounded_api_key:success");
+    assert.equal(
+      boundedUsageRollupCommands.filter((record) => record.command === "get").length,
+      1,
+      "one observed buffered response reads the terminal usage-rollup shard once"
+    );
+    assert.equal(
+      boundedUsageRollupCommands.filter((record) => record.command === "atomic.commit" && record.atomicResult === "committed").length,
+      1,
+      "one observed buffered response records exactly one terminal usage-rollup merge"
+    );
+    // A cancelled Codex stream never observed usage, so the writer skips it
+    // rather than inventing a zero-token row; the disconnect keeps only its V3
+    // reservation and dispatch commits plus the serial admission CAS.
     assert.equal(
       disconnect.atomic_commits,
       3,
       "a post-dispatch disconnect retains the V3 reservation and dispatch commits plus the serial active-account admission CAS"
+    );
+    assert.equal(
+      usageRollupCommandsFor("bounded_api_key:client_disconnect").length,
+      0,
+      "an unobserved terminal response must not write a fabricated zero-token usage row"
     );
     const disconnectV3Commits = kv.commands.filter(
       (record) =>

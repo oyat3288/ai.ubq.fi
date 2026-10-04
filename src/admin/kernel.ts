@@ -38,7 +38,7 @@ import {
   readMeteredQuotaBalanceHistory,
   resampleMeteredQuotaBalanceHistory,
 } from "../metered-quota.ts";
-import { listPaidFallbackUsageRollups, PAID_FALLBACK_USAGE_ROLLUP_BUCKET_MS } from "../paid-fallback/rollups.ts";
+import { listPaidFallbackUsageRollups, PAID_FALLBACK_SETTLED_PROVIDERS, PAID_FALLBACK_USAGE_ROLLUP_BUCKET_MS } from "../paid-fallback/rollups.ts";
 import { groupPaidFallbackUsageRollups, meteredQuotaRunwayView, projectPaidFallbackRunway, summarizePaidFallbackUsage } from "../quota-projection.ts";
 import {
   normalizeKernelExpiresAtMsInput,
@@ -475,6 +475,11 @@ export const handleAdminProvidersQuotaProjection = async (
     model: entry.model,
     provider: entry.provider,
     quota_source: entry.provider === "metered" ? "metered" : null,
+    // `paid_fallback` rows come from settlement, carry quota and spend, and are
+    // the only ones with balance-runway estimates. `observability` rows are the
+    // terminal accounting for the rest of the waterfall (Codex subscription
+    // capacity first): request and token history that never moves the balance.
+    usage_source: PAID_FALLBACK_SETTLED_PROVIDERS.has(entry.provider) ? "paid_fallback" : "observability",
     usage: entry.windows.filter((window) => window.window_days === windowDays),
     estimates: projectPaidFallbackRunway(entry, quota, nowMs).filter((estimate) => estimate.window_days === windowDays),
   }));

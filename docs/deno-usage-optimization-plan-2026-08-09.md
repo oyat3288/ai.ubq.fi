@@ -135,6 +135,14 @@ bytes, ledger separation, and durable-operation floors.
 | Bounded API key, client disconnect           |            13 |               6 |              3 |                 12 |                 2 |           209 |             63 |               12 |
 | Bounded API key, eight concurrent admissions |           128 |               8 |              4 |                110 |                 8 |           209 |            181 |              123 |
 
+Since that sample, the terminal usage rollup (`docs/log-retention-and-quota-runway-2026-08-25.md`) deliberately adds one
+strong read, one write mutation and one atomic commit for every terminal response with observed usage on a route the
+paid ledger cannot see. Responses that never observed usage — the cancelled Codex stream and the failed upstream in this
+fixture — cost nothing and are never recorded as zero-token rows. The fixture records that cost per scenario instead of
+absorbing it, and the committed before/after `operation-byte-budget` capture lives in the rollup document:
+`bounded_api_key:success` now asserts exactly one usage-rollup read and one merge commit, while
+`bounded_api_key:client_disconnect` and `bounded_api_key:upstream_failure` assert zero usage-rollup commands.
+
 Before this fixture, this worktree had no per-auth-kind command/atomic or Codex serialization-byte baseline. The
 required implementation handoff ties this table to its exact tested commit. The fixture asserts that UOS and admin
 allowlist paths do not access V3 API-key ledger keys, while the bounded paths retain durable reservation, dispatch, and
