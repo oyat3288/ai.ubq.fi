@@ -175,23 +175,33 @@ const reduceForwardedPayload = (
   }
 };
 
-const chatToolResultItem = (
+/**
+ * A replayed tool result. Codex also replays a named unpaired output
+ * (`name`/`namespace`, no `call_id`) for tools its own client ran, for example
+ * an app-server `toolOutput` turn. Chat Completions can only express a result
+ * as the `tool_call_id` answer to a preceding `tool_calls` entry, so an
+ * unpaired output has no destination and contributes no message instead of
+ * failing the whole request. Re-attaching it to an earlier call of the same
+ * name is not safe: two calls of one tool in a turn are indistinguishable here,
+ * and a wrong pairing would silently corrupt the replayed conversation.
+ */
+const chatToolResultItems = (
   item: Record<string, unknown>,
   reduction: ForwardedPayloadReduction,
   path: string,
   elisions: ForwardedPayloadElision[]
-): DeepSeekResponsesResult<Record<string, unknown>> => {
+): DeepSeekResponsesResult<Record<string, unknown>[]> => {
   const callId = getString(item.call_id);
-  if (!callId) return failure("input", "function_call_output items require call_id");
+  if (!callId) return { ok: true, value: [] };
   const raw = typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "");
   const bytes = forwardedByteLength(raw);
   if (bytes <= FORWARDED_PAYLOAD_POLICY.perMessageLimit) {
-    return { ok: true, value: { role: "tool", tool_call_id: callId, content: raw } };
+    return { ok: true, value: [{ role: "tool", tool_call_id: callId, content: raw }] };
   }
   if (reduction === "reject") return oversizedPayloadFailure(path, bytes, callId);
   const reduced = reduceForwardedPayload(raw, path, callId);
   elisions.push(reduced.elision);
-  return { ok: true, value: { role: "tool", tool_call_id: callId, content: reduced.content } };
+  return { ok: true, value: [{ role: "tool", tool_call_id: callId, content: reduced.content }] };
 };
 
 /**
@@ -264,7 +274,9 @@ const appendMessageItem = (
  * `function_call` item and its matching `function_call_output` become an
  * assistant turn carrying `tool_calls` followed by the tool result, which is
  * the only shape the Chat contract accepts. A `reasoning` item is carried onto
- * the assistant turn that follows it as `reasoning_content`.
+ * the assistant turn that follows it as `reasoning_content`. A replayed
+ * `function_call_output` with no `call_id` has no Chat destination and is
+ * skipped instead of failing the request.
  */
 /**
  * A sub-agent message envelope. Chat Completions has no agent addressing, so
@@ -351,9 +363,9 @@ const appendInputItem = (
     return { ok: true, value: undefined };
   }
   if (type === "function_call_output" || type === "custom_tool_call_output") {
-    const result = chatToolResultItem(rawItem, reduction, `${path}.output`, elisions);
+    const result = chatToolResultItems(rawItem, reduction, `${path}.output`, elisions);
     if (!result.ok) return result;
-    messages.push(result.value);
+    messages.push(...result.value);
     return { ok: true, value: undefined };
   }
   if (type === "agent_message") {

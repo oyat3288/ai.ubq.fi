@@ -903,3 +903,90 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "oss gateway real HTTP: a call_id-less function_call_output is dropped before dispatch",
+  ignore: loopbackPermission.state !== "granted" || typeof Deno.openKv !== "function",
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const originalInfo = console.info;
+    const originalDeepSeekKey = Deno.env.get("DEEPSEEK_API_KEY");
+    const originalSurplusKey = Deno.env.get("SURPLUS_API_KEY");
+    const originalMeteredKey = Deno.env.get("METERED_API_KEY");
+    const env = Deno.env;
+    const harness = await startHarness();
+    const stop = harness.stop;
+    try {
+      assert.equal(originalSurplusKey, undefined, "no paid Surplus credential may be present; `deno task test` removes it and skips .env");
+      assert.equal(originalMeteredKey, undefined, "no paid Metered credential may be present; `deno task test` removes it and skips .env");
+      env.delete("SURPLUS_API_KEY");
+      env.delete("METERED_API_KEY");
+      env.set("DEEPSEEK_API_KEY", "oss-http-dummy-deepseek-key");
+      const { config } = await import("../src/config.ts");
+      const originalDeployFlag = config.isDeploy;
+      (config as { isDeploy: boolean }).isDeploy = true;
+      console.info = () => {};
+
+      try {
+        // A stored Codex thread can replay a named unpaired output (no call_id)
+        // beside a normal user message. Chat cannot answer it, so the projection
+        // drops it and the request still completes.
+        harness.setMode("chat-buffered-answer");
+        const completed = await postJson(
+          harness,
+          "/v1/responses",
+          responsesBody({
+            stream: false,
+            input: [
+              { type: "message", role: "user", content: [{ type: "input_text", text: "deliver it" }] },
+              {
+                type: "function_call_output",
+                name: "send_message_to_thread",
+                namespace: "codex_tui",
+                output: "<codex_delegation>\n  <input>Continue the task</input>\n</codex_delegation>",
+              },
+            ],
+          })
+        );
+        assert.equal(completed.status, 200);
+        const payload = (await completed.json()) as Record<string, unknown>;
+        assert.equal(payload.status, "completed");
+        assert.equal(payload.error, null);
+
+        // The provider body carries only the user turn: the unpaired output has
+        // no Chat destination, and a bare `tool` message would be a protocol error.
+        assert.equal(harness.calls.length, 1, "the completed request must dispatch exactly once");
+        const upstreamBody = JSON.parse(harness.calls[0].body) as { messages: Record<string, unknown>[] };
+        assert.deepEqual(upstreamBody.messages, [{ role: "user", content: "deliver it" }]);
+
+        // The malformed shapes still fail closed before any provider dispatch.
+        const malformedCall = await postJson(harness, "/v1/responses", responsesBody({ stream: false, input: [{ type: "function_call", name: "lookup" }] }));
+        assert.equal(malformedCall.status, 400);
+        const malformedError = (await malformedCall.json()) as { error: { message: string; param: string } };
+        assert.equal(malformedError.error.param, "input");
+        assert.equal(malformedError.error.message, "function_call items require call_id and name");
+
+        const unknownType = await postJson(harness, "/v1/responses", responsesBody({ stream: false, input: [{ type: "computer_call", call_id: "c" }] }));
+        assert.equal(unknownType.status, 400);
+        const unknownError = (await unknownType.json()) as { error: { message: string; param: string } };
+        assert.equal(unknownError.error.param, "input.type");
+        assert.equal(unknownError.error.message, "input item type 'computer_call' is not supported");
+
+        assert.equal(harness.calls.length, 1, "rejected item shapes must never reach the provider");
+      } finally {
+        console.info = originalInfo;
+        (config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
+      }
+    } finally {
+      harness.releaseHold();
+      await stop();
+      if (originalDeepSeekKey === undefined) env.delete("DEEPSEEK_API_KEY");
+      else env.set("DEEPSEEK_API_KEY", originalDeepSeekKey);
+      if (originalSurplusKey === undefined) env.delete("SURPLUS_API_KEY");
+      else env.set("SURPLUS_API_KEY", originalSurplusKey);
+      if (originalMeteredKey === undefined) env.delete("METERED_API_KEY");
+      else env.set("METERED_API_KEY", originalMeteredKey);
+    }
+  },
+});

@@ -593,6 +593,8 @@ Deno.test("deepseek responses: projects a sub-agent message envelope onto a user
         recipient: "/root",
         content: [
           { type: "input_text", text: "ok" },
+          // Multiple readable parts join in order, one newline between them.
+          { type: "input_text", text: "follow-up payload" },
           // A thread whose model runs outside the ChatGPT backend carries its
           // payload here in the clear, so it must reach the model.
           { type: "encrypted_content", encrypted_content: "payload-from-worker" },
@@ -604,7 +606,7 @@ Deno.test("deepseek responses: projects a sub-agent message envelope onto a user
   assert.equal(plaintextPayload.ok, true);
   assert.deepEqual(plaintextPayload.value, [
     { role: "user", content: "delegate this" },
-    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\npayload-from-worker" },
+    { role: "user", content: "[agent message] /root/probe_qwen2 -> /root:\nok\nfollow-up payload\npayload-from-worker" },
   ]);
 
   // A sealed payload is a Fernet token only the ChatGPT backend can open, so it
@@ -1348,4 +1350,68 @@ Deno.test("deepseek responses: bounds oversized forwarded payloads under the dec
   if (bogus.ok) throw new Error("expected an unsupported-value failure");
   assert.equal(bogus.param, "truncation");
   assert.equal(bogus.code, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Replayed Codex item shapes.
+//
+// A Codex thread replays its stored history on every request, so an item shape
+// the adapter refuses cannot be cleared by repairing one thread.
+// ---------------------------------------------------------------------------
+
+Deno.test("deepseek responses: a call_id-less function_call_output is skipped, not fatal", () => {
+  // Codex's app-server replays a named unpaired output (`name`/`namespace`, no
+  // `call_id`) for a tool its own client ran. Chat can only answer a preceding
+  // `tool_calls` entry, so the output is dropped rather than re-paired by name;
+  // a paired output beside it still replays normally.
+  const codexTuiToolOutput = {
+    type: "function_call_output",
+    name: "send_message_to_thread",
+    namespace: "codex_tui",
+    output: "<codex_delegation>\n  <input>Continue the task</input>\n</codex_delegation>",
+  };
+  const translated = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: "deliver it" },
+      codexTuiToolOutput,
+      { type: "function_call_output", call_id: "call_1", output: "paired output" },
+    ],
+    null
+  );
+  assert.equal(translated.ok, true);
+  assert.deepEqual(translated.value, [
+    { role: "user", content: "deliver it" },
+    { role: "tool", tool_call_id: "call_1", content: "paired output" },
+  ]);
+
+  // A freeform output shares the branch and the same rule.
+  const customOutput = toDeepSeekChatMessages(
+    [
+      { type: "message", role: "user", content: "deliver it" },
+      { type: "custom_tool_call_output", output: "freeform" },
+    ],
+    null
+  );
+  assert.equal(customOutput.ok, true);
+  assert.deepEqual(customOutput.value, [{ role: "user", content: "deliver it" }]);
+
+  // With nothing representable left to send, the request still fails, but for
+  // the honest reason: there is no message, not a rejected item shape.
+  const toolOutputOnly = toDeepSeekResponsesChatBody({ input: [codexTuiToolOutput] }, "deepseek-flash", false);
+  assert.equal(toolOutputOnly.ok, false);
+  assert.equal(toolOutputOnly.param, "input");
+  assert.equal(toolOutputOnly.message, "input must contain at least one message");
+});
+
+Deno.test("deepseek responses: malformed function_call and unknown item types still fail", () => {
+  // A function_call without its call_id/name pair remains a protocol violation.
+  const callWithoutId = toDeepSeekChatMessages([{ type: "function_call", name: "lookup" }], null);
+  assert.equal(callWithoutId.ok, false);
+  assert.equal(callWithoutId.param, "input");
+  assert.equal(callWithoutId.message, "function_call items require call_id and name");
+  // An unknown item type is still refused instead of being approximated.
+  const unknownItem = toDeepSeekChatMessages([{ type: "computer_call", call_id: "c" }], null);
+  assert.equal(unknownItem.ok, false);
+  assert.equal(unknownItem.param, "input.type");
+  assert.equal(unknownItem.message, "input item type 'computer_call' is not supported");
 });

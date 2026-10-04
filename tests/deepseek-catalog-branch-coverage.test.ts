@@ -206,11 +206,9 @@ Deno.test("chat projection: tool call and tool result items round-trip", () => {
     param: "input",
     message: "custom_tool_call items require call_id and name",
   });
-  assert.deepEqual(rejectionOf([{ type: "function_call_output", output: "42" }]), {
-    ok: false,
-    param: "input",
-    message: "function_call_output items require call_id",
-  });
+  // An unpaired output has no Chat destination, so it is skipped rather than
+  // rejected: the projection succeeds with no message for that item.
+  assert.deepEqual(messagesOf([{ type: "function_call_output", output: "42" }]), []);
 });
 
 Deno.test("chat projection: replayed reasoning is carried onto the following assistant turn", () => {
