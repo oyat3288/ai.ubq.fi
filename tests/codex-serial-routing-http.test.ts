@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { CODEX_ACCOUNT_ROUTING_KV_KEY, type CodexAccountRoutingState, codexCredentialVersion, type CodexRoutingSlot } from "../src/codex_account_routing.ts";
+import {
+  CODEX_ACCOUNT_ROUTING_KV_KEY,
+  CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
+  type CodexAccountRoutingState,
+  codexCredentialVersion,
+  type CodexRoutingSlot,
+  parseCodexActiveAccountSelection,
+} from "../src/codex/account-routing.ts";
 import type { ApiKeyHashRecord, ApiKeyRecord, CodexAuthState } from "../src/types.ts";
 import { sha256Base64Url, sha256Hex } from "../src/utils.ts";
 
@@ -106,11 +113,11 @@ Deno.test({
 
     try {
       const { setKvForTest } = await import("../src/kv.ts");
-      const { resetCodexAccountRoutingForTest } = await import("../src/codex_account_routing.ts");
-      const { resetCodexAuthCacheForTest } = await import("../src/codex.ts");
+      const { resetCodexAccountRoutingForTest } = await import("../src/codex/account-routing.ts");
+      const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
       const { config } = await import("../src/config.ts");
-      const { default: handler } = await import("../src/handler.ts");
-      const { createServeHandler } = await import("../src/serve_handler.ts");
+      const { default: handler } = await import("../src/handler/index.ts");
+      const { createServeHandler } = await import("../src/handler/serve-handler.ts");
 
       setKvForTest(kv);
       resetCodexAccountRoutingForTest();
@@ -361,17 +368,56 @@ Deno.test({
         false,
         warnings.join("\n")
       );
+
+      // Narrowing the operator selection to B re-admits B at its durable
+      // full-pool slot (1), not its narrowed index (0): the committed active
+      // row and the final pre-transport fence must resolve the same account.
+      const authPoolEntry = await kv.get(CODEX_AUTH_POOL_KV_KEY);
+      await kv.set(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY, {
+        v: 1,
+        account_id_hash: await routingAccountIdHash(ACCOUNT_A),
+        credential_version: await codexCredentialVersion(accountA),
+        pool_versionstamp: authPoolEntry.versionstamp,
+        slot: 0,
+        routing_generation: 0,
+        generation: 1,
+        transition_reason: null,
+        updated_at_ms: Date.now(),
+      });
+      const { codexSubscriptionHash, codexSubscriptionSelectionId, PROVIDER_SELECTION_KV_KEY, resetProviderSelectionCacheForTest } =
+        await import("../src/provider/selection.ts");
+      await kv.set(PROVIDER_SELECTION_KV_KEY, {
+        provider_ids: [codexSubscriptionSelectionId(await codexSubscriptionHash(ACCOUNT_B))],
+        updated_at_ms: Date.now(),
+      });
+      resetProviderSelectionCacheForTest();
+      const narrowed = await callGateway(KEY_TWO);
+      assert.equal(narrowed.status, 200, JSON.stringify(upstreamCalls));
+      assert.equal(narrowed.completed, true);
+      assert.equal(narrowed.text, `serial-routing-http-${requestIndex - 1}`);
+      expectServedBy(ACCOUNT_B);
+      const narrowedActive = parseCodexActiveAccountSelection((await kv.get(CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY)).value);
+      assert.ok(narrowedActive, "the narrowed admission must commit an active row");
+      assert.equal(narrowedActive.slot, 1, "narrowing must keep B's durable full-pool slot");
+      assert.equal(narrowedActive.account_id_hash, await routingAccountIdHash(ACCOUNT_B));
+
+      // The committed active row keeps serving the narrowed cohort.
+      const narrowedAgain = await callGateway(KEY_TWO);
+      assert.equal(narrowedAgain.status, 200, JSON.stringify(upstreamCalls));
+      expectServedBy(ACCOUNT_B);
     } finally {
       Date.now = originalNow;
       globalThis.fetch = originalFetch;
       console.info = originalInfo;
       console.warn = originalWarn;
       const { setKvForTest } = await import("../src/kv.ts");
-      const { resetCodexAuthCacheForTest } = await import("../src/codex.ts");
+      const { resetCodexAuthCacheForTest } = await import("../src/codex/index.ts");
       const configModule = await import("../src/config.ts");
       if (originalDeployFlag !== null) (configModule.config as { isDeploy: boolean }).isDeploy = originalDeployFlag;
       setKvForTest(null);
       resetCodexAuthCacheForTest();
+      const { resetProviderSelectionCacheForTest } = await import("../src/provider/selection.ts");
+      resetProviderSelectionCacheForTest();
       if (gatewayServer) await gatewayServer.shutdown();
       if (providerServer) await providerServer.shutdown();
       kv.close();

@@ -197,12 +197,25 @@ const kv = memoryKv as unknown as Deno.Kv;
 const originalOpenKv = (Deno as unknown as { openKv?: () => Promise<Deno.Kv> }).openKv;
 (Deno as unknown as { openKv?: () => Promise<Deno.Kv> }).openKv = () => Promise.resolve(kv);
 
-const { apiKeyHashKey, apiKeyIdKey } = await import("../src/api_keys.ts");
+const { apiKeyHashKey, apiKeyIdKey } = await import("../src/api-keys.ts");
 const { apiKeyRequestLogKey, recordApiKeyRequestLog, updateApiKeyRequestLog } = await import("../src/analytics.ts");
-const { hasStrictPaidFallbackKeyPolicy, hasStrictPaidFallbackPolicy, reservePaidFallback } = await import("../src/paid_fallback.ts");
+const { hasStrictPaidFallbackKeyPolicy, hasStrictPaidFallbackPolicy, reservePaidFallback } = await import("../src/paid-fallback/index.ts");
 const {
   admitPaidFallbackV3,
   deletePaidFallbackStateV3,
+  releasePaidFallbackBeforeProviderFetchV3,
+  releaseUndispatchedPaidFallbackV3,
+  updatePaidFallbackRequestV3,
+} = await import("../src/paid-fallback/ledger-admission.ts");
+const {
+  markPaidFallbackTerminalV3,
+  reconcileDuePaidFallbacksV3,
+  reconcilePaidFallbackV3,
+  recordPaidFallbackTerminalV3,
+  enqueueDuePaidFallbackReconciliationJobsV3,
+  handlePaidFallbackReconciliationJobV3,
+} = await import("../src/paid-fallback/ledger-backfill.ts");
+const {
   getPaidFallbackOutstandingV3,
   getPaidFallbackWindowProjectionV3,
   listPaidFallbackRequestsV3,
@@ -212,16 +225,7 @@ const {
   paidFallbackPendingV3Key,
   paidFallbackReconciliationLeaseV3Key,
   paidFallbackWindowV3Key,
-  markPaidFallbackTerminalV3,
-  reconcileDuePaidFallbacksV3,
-  reconcilePaidFallbackV3,
-  recordPaidFallbackTerminalV3,
-  releasePaidFallbackBeforeProviderFetchV3,
-  releaseUndispatchedPaidFallbackV3,
-  enqueueDuePaidFallbackReconciliationJobsV3,
-  handlePaidFallbackReconciliationJobV3,
-  updatePaidFallbackRequestV3,
-} = await import("../src/paid_fallback_ledger.ts");
+} = await import("../src/paid-fallback/ledger-state.ts");
 const { getKv } = await import("../src/kv.ts");
 await getKv();
 
@@ -642,6 +646,52 @@ Deno.test("paid fallback admission re-reads policy when a committed disable race
   assert.equal((await memoryKv.get(paidFallbackRequestV3Key(keyId, requestId))).value, null);
   const policy = await memoryKv.get<Record<string, unknown>>(apiKeyIdKey(keyId));
   assert.equal(policy.value?.paid_fallback_enabled, false);
+});
+
+Deno.test("paid fallback admission reconciles a due reservation and fails closed while exposure is unresolved", async () => {
+  memoryKv.clear();
+  const originalFetch = globalThis.fetch;
+  const keyId = "admission-due-reconcile";
+  const providerRequestId = "provider-admission-due";
+  const providerLogs: Record<string, unknown>[] = [];
+  let fetchCalls = 0;
+  globalThis.fetch = () => {
+    fetchCalls += 1;
+    return Promise.resolve(Response.json({ success: true, data: providerLogs }));
+  };
+  try {
+    await withMeteredApiKey(async () => {
+      await seedStrictKey({ id: keyId, paid_fallback_limit_microcredits: 500_000 });
+      const first = await reservePaidFallback(reservationInput(keyId, `${keyId}-first`));
+      if (first.kind !== "reserved") throw new Error(`expected the first reservation, got ${first.kind}`);
+      assert.equal((await reservePaidFallback(reservationInput(keyId, `${keyId}-second`))).kind, "reserved");
+      await updatePaidFallbackRequestV3(first.reservation, { provider_request_id: providerRequestId, dispatch_state: "dispatched" });
+      const blocked = await reservePaidFallback(reservationInput(keyId, `${keyId}-third`));
+      if (blocked.kind !== "blocked") throw new Error(`expected a blocked admission, got ${blocked.kind}`);
+      assert.equal(blocked.reason, "limit_exceeded");
+      assert.equal(fetchCalls, 1);
+      providerLogs.push({
+        request_id: providerRequestId,
+        quota: 10_000,
+        prompt_tokens: 1,
+        completion_tokens: 2,
+        model_name: "gpt-5-codex",
+        created_at: Math.trunc(Date.now() / 1_000),
+      });
+      await memoryKv.set(paidFallbackPendingV3Key(keyId, first.reservation.request_id), {
+        created_at_ms: first.reservation.created_at_ms,
+        next_reconciliation_at_ms: Date.now() - 1,
+      });
+      await memoryKv.set(paidFallbackReconciliationGateV3Key(), { next_due_at_ms: 0 });
+      const third = await reservePaidFallback(reservationInput(keyId, `${keyId}-third`));
+      if (third.kind !== "reserved") throw new Error(`expected the retried admission to reserve, got ${third.kind}`);
+      assert.equal(third.reservation.reserved_microcredits, 230_000);
+      const settled = await memoryKv.get<Record<string, unknown>>(paidFallbackRequestV3Key(keyId, first.reservation.request_id));
+      assert.equal(settled.value?.spend_microcredits, 20_000);
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 Deno.test("V3 unlimited admission writes independent rows without a shared window", async () => {
