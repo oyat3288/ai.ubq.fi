@@ -1037,11 +1037,8 @@ Deno.test("capacity endpoint revalidates stale reads and reuses fresh persisted 
   kvStore.put(promptCacheAnalyticsCounterKey(nowMs, "cache_write_input_tokens"), { value: 50n } as Deno.KvU64);
   kvStore.put(promptCacheAnalyticsCounterKey(nowMs, "cache_write_reported_sample_count"), { value: 2n } as Deno.KvU64);
   kvStore.put(promptCacheAnalyticsCounterKey(nowMs, "sample_count"), { value: 2n } as Deno.KvU64);
-  let calls = 0;
-  const fetcher = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    calls += 1;
-    return createFetcher([], null)(input, init);
-  };
+  const calls: { account: string | null; authorization: string | null; url: string }[] = [];
+  const fetcher = createFetcher(calls);
 
   // Without a persisted snapshot a normal read revalidates instead of serving unavailable.
   const initial = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity"), {
@@ -1058,7 +1055,8 @@ Deno.test("capacity endpoint revalidates stale reads and reuses fresh persisted 
     };
   };
   assert.equal(initialBody.cache_state, "live");
-  assert.equal(calls, 3);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.filter((call) => call.url.startsWith("https://api.openlux.ai/api/")).length, 0);
   assert.equal(initialBody.prompt_cache?.bucket_ms, PROMPT_CACHE_ANALYTICS_BUCKET_MS);
   assert.equal(initialBody.prompt_cache.buckets?.[0]?.cached_percentage, 50);
   assert.equal(initialBody.prompt_cache.buckets[0]?.cache_write_input_tokens, 50);
@@ -1072,7 +1070,7 @@ Deno.test("capacity endpoint revalidates stale reads and reuses fresh persisted 
   const freshBody = (await fresh.json()) as { cache_state?: string; history?: unknown[] };
   assert.equal(freshBody.cache_state, "persisted");
   assert.equal(freshBody.history?.length, 1);
-  assert.equal(calls, 3);
+  assert.equal(calls.length, 2);
 
   // `?refresh=live` still forces a probe inside the freshness window.
   const live = await handleProviderCapacity(new Request("https://ai.ubq.fi/admin/providers/capacity?refresh=live"), {
@@ -1081,7 +1079,8 @@ Deno.test("capacity endpoint revalidates stale reads and reuses fresh persisted 
     now: () => nowMs + 1_000,
   });
   assert.equal(((await live.json()) as { cache_state?: string }).cache_state, "live");
-  assert.equal(calls, 6);
+  assert.equal(calls.length, 5);
+  assert.equal(calls.filter((call) => call.url.startsWith("https://api.openlux.ai/api/")).length, 1);
 });
 
 Deno.test("stale default read delivers the changed upstream Codex quota value", async () => {
@@ -1103,7 +1102,23 @@ Deno.test("stale default read delivers the changed upstream Codex quota value", 
   const changedBody = (await changed.json()) as { cache_state?: string; sources?: readonly ProviderCapacitySource[] };
   assert.equal(changedBody.cache_state, "live");
   assert.equal(codexSourceAt(changedBody.sources ?? [], 1)?.windows.primary?.used_percent, 5);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.filter((call) => call.url.startsWith("https://api.openlux.ai/api/")).length, 0);
+});
+
+Deno.test("event capacity samples still force-refresh Metered quota", async () => {
+  seed();
+  await refreshProviderCapacity({ kv: kvStub, fetcher: createFetcher([]), now: () => nowMs });
+
+  const calls: { account: string | null; authorization: string | null; url: string }[] = [];
+  await sampleProviderCapacityOnEvent({
+    kv: kvStub,
+    fetcher: createFetcher(calls, null, { total_available: 1_750, total_granted: 2_000, total_used: 250 }),
+    now: () => nowMs + 1_000,
+    createLeaseOwner: () => "event-metered-refresh",
+  });
+
+  assert.equal(calls.filter((call) => call.url.startsWith("https://api.openlux.ai/api/")).length, 1);
 });
 
 Deno.test("concurrent stale default reads share one upstream refresh", async () => {
