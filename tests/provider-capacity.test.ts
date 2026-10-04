@@ -1383,8 +1383,8 @@ Deno.test("event sampler persists capacity without building the discarded admin 
       "the event sampler must not enumerate history or reset-event projection prefixes"
     );
     // The quota refresh inside a sample also appends at most one hourly
-    // balance-history read plus one upsert, hence the 22-command ceiling.
-    assert.ok(samplerBudget.commands <= 22, `event sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
+    // balance-history read plus one upsert; the rollup read is the 23rd command.
+    assert.ok(samplerBudget.commands <= 23, `event sampler budget unexpectedly grew to ${samplerBudget.commands} KV commands`);
     assert.notEqual((await samplerKv.get(PROVIDER_CAPACITY_SNAPSHOT_KEY)).value, null);
     assert.notEqual((await samplerKv.get(providerCapacityHistoryKey(nowMs))).value, null);
     assert.notEqual((await samplerKv.get(CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY)).value, null);
