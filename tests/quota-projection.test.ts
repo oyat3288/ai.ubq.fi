@@ -632,8 +632,8 @@ Deno.test("subscription observations join the projection without runway estimate
   assert.ok(subscription, "the subscription provider must be part of the projection");
   const window = subscription.windows.find((candidate) => candidate.window_days === 30);
   assert.equal(window?.request_count, 1);
-  assert.equal(window?.input_tokens, 50);
-  assert.equal(window?.quota_sum, 0);
+  assert.equal(window.input_tokens, 50);
+  assert.equal(window.quota_sum, 0);
   // Nothing in an observability row can be projected against the OpenLux balance.
   assert.deepEqual(projectPaidFallbackRunway(subscription, meteredQuotaRunwayView(null), now), []);
 });
