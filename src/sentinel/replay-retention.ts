@@ -282,6 +282,7 @@ const publishAttemptRow = (
   if (!Number.isSafeInteger(context.actualCharge) || context.actualCharge <= 0) return null;
   if (context.actualCharge > row.bytes) return null;
   if (ledger.reserved_bytes < row.bytes) return null;
+  if (ledger.records + 1 > SENTINEL_REPLAY_MAX_RECORDS) return null;
   // The published charge must fit what the reservation already held back: the
   // reserved charge is released in the same commit that stores the actual one.
   if (ledger.stored_bytes + ledger.reserved_bytes - row.bytes + context.actualCharge > context.payloadBudget) return null;
@@ -731,16 +732,24 @@ const selectVictims = async (
 };
 
 /**
- * Evict oldest stored captures until the ledger reaches the target. Each victim
- * is claimed by exactly one caller before anything is deleted, and its charge is
- * released only when its chunk prefix is proven empty.
+ * Evict oldest stored captures until the ledger reaches its byte and record
+ * targets. Each victim is claimed by exactly one caller before anything is
+ * deleted, and its charge is released only when its chunk prefix is proven empty.
  */
 export const evictSentinelReplays = async (
   kv: Deno.Kv,
-  options: Readonly<{ target_bytes: number; max_records?: number; max_chunk_deletes?: number; now_ms: number; budget_bytes?: number }>
+  options: Readonly<{
+    target_bytes: number;
+    target_records?: number;
+    max_records?: number;
+    max_chunk_deletes?: number;
+    now_ms: number;
+    budget_bytes?: number;
+  }>
 ): Promise<Readonly<{ records: number; bytes: number; chunks: number }>> => {
   const budgetBytes = Math.max(64 * 1_024, Math.trunc(options.budget_bytes ?? sentinelReplayBudgetBytes()));
   const maxRecords = Math.max(1, Math.min(EVICTION_BATCH_RECORDS, options.max_records ?? EVICTION_BATCH_RECORDS));
+  const targetRecords = options.target_records === undefined ? null : Math.max(0, Math.trunc(options.target_records));
   // Expired payloads belong to the TTL reclamation pass, which reports them as
   // `expired`; eviction only claims rows whose payload TTL has not passed, so a
   // resumed `evicting` row's claim kind is unambiguous.
@@ -754,7 +763,7 @@ export const evictSentinelReplays = async (
     const state = await readLedger(kv, budgetBytes);
     if (state.kind === "corrupt") break;
     const ledger = withBudget(state.ledger, budgetBytes);
-    if (ledger.stored_bytes <= options.target_bytes) break;
+    if (ledger.stored_bytes <= options.target_bytes && (targetRecords === null || ledger.records <= targetRecords)) break;
     if (!(await claimVictim(kv, victim.key, victim.row, budgetBytes))) continue;
     const result = await finalizeClaimedVictim(kv, victim.key, victim.row, "evicted", options.now_ms, budgetBytes, remainingDeletes);
     chunks += result.chunks;
@@ -790,14 +799,19 @@ export const reclaimExpiredSentinelReplays = async (
 };
 
 /**
- * Bounded cleanup for an over-budget admission: reclaim payload-TTL expiry first,
- * then evict oldest-first toward the clean target. Returns whether any capacity
- * was actually reclaimed, so a refusal is only reported when nothing moved.
+ * Bounded cleanup for an over-budget or over-cap admission: reclaim payload-TTL
+ * expiry first, then evict oldest-first toward both clean targets. Returns whether
+ * any capacity was actually reclaimed, so a refusal is only reported when nothing moved.
  */
 const reclaimAdmissionCapacity = async (kv: Deno.Kv, budgetBytes: number, payloadBudget: number, charge: number, nowMs: number): Promise<boolean> => {
   const target = Math.floor(payloadBudget * SENTINEL_REPLAY_CLEAN_TARGET_RATIO) - charge;
   const expired = await reclaimExpiredSentinelReplays(kv, { now_ms: nowMs, budget_bytes: budgetBytes });
-  const evicted = await evictSentinelReplays(kv, { target_bytes: Math.max(0, target), now_ms: nowMs, budget_bytes: budgetBytes });
+  const evicted = await evictSentinelReplays(kv, {
+    target_bytes: Math.max(0, target),
+    target_records: SENTINEL_REPLAY_MAX_RECORDS - 1,
+    now_ms: nowMs,
+    budget_bytes: budgetBytes,
+  });
   return evicted.records > 0 || expired.records > 0;
 };
 
