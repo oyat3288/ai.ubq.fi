@@ -203,6 +203,51 @@ Deno.test("codex models: the pool catalog unions every account in pool order and
   }
 });
 
+Deno.test("codex models: unusable account rows are dropped while valid rows and sibling eligibility survive", async () => {
+  seedPool([codexAccount("rows-a"), codexAccount("rows-b")]);
+  clearAvailabilityKv();
+  const firstRow = {
+    slug: "first-account-model",
+    context_window: 128_000,
+    supported_reasoning_levels: [{ effort: "ultra", description: "Source tier" }],
+    source_metadata: { retained: true },
+  };
+  const siblingRow = {
+    slug: MODEL,
+    context_window: 256_000,
+    supported_reasoning_levels: [{ effort: "low", description: "Sibling tier" }],
+  };
+  const originalFetch = globalThis.fetch;
+  const seen: { ifNoneMatch: string | null; calls: number } = { ifNoneMatch: "unset", calls: 0 };
+  globalThis.fetch = catalogFetch(
+    {
+      "rows-a": { models: [null, {}, { slug: " " }, { slug: 7 }, "invalid", false, 42, [], firstRow], has_more: true },
+      "rows-b": { models: [{ ...firstRow, context_window: 1 }, siblingRow], has_more: false },
+    },
+    seen
+  );
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"cached"' });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { models: [firstRow, siblingRow], has_more: true }, "valid native rows and their source tiers remain verbatim");
+    assert.equal(seen.calls, 2, "both account catalogs are fetched");
+    assert.equal(seen.ifNoneMatch, null, "the multi-account union remains unconditional");
+    const store = getCodexAccountModelsCacheForTest().store;
+    assert.ok(store, "each account's usable catalog identifiers are recorded");
+    assert.deepEqual(store.accounts["rows-a"].slugs, [firstRow.slug]);
+    assert.deepEqual(store.accounts["rows-b"].slugs, [firstRow.slug, MODEL]);
+    assert.equal(codexModelUnavailableAccounts(MODEL, ["rows-a", "rows-b"]).has("rows-a"), true, "only the sibling advertises its model");
+    assert.equal(codexModelUnavailableAccounts(MODEL, ["rows-a", "rows-b"]).has("rows-b"), false);
+    assert.equal(
+      codexModelUnavailableAccounts("unknown-model", ["rows-a", "rows-b"]).size,
+      0,
+      "unusable rows create no eligibility evidence for unknown models"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test("codex models: one configured account keeps the upstream response and its conditional request", async () => {
   seedPool([codexAccount("single-account")]);
   clearAvailabilityKv();
@@ -220,6 +265,90 @@ Deno.test("codex models: one configured account keeps the upstream response and 
     assert.equal(seen.ifNoneMatch, '"catalog-1"');
     assert.equal(seen.calls, 1);
     assert.equal(getCodexAccountModelsCacheForTest().store, null, "a 304 records no catalog");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("codex models: a fresh single-account catalog clears only its advertised model rejection", async () => {
+  const accounts = [codexAccount("single-refresh")];
+  const poolVersionstamp = seedPool(accounts);
+  await seedActiveRow(accounts[0], poolVersionstamp, 0, 1);
+  clearAvailabilityKv();
+  await recordCodexAccountCatalogs([{ accountId: "sibling", clientVersion: "0.159.0", slugs: ["sibling-only"] }]);
+  await recordCodexModelUnsupported(accounts[0].account_id, MODEL, { detail: UNSUPPORTED_DETAIL });
+  await recordCodexModelUnsupported(accounts[0].account_id, "absent-model");
+  await recordCodexModelUnsupported("sibling", MODEL);
+  const before = getCodexAccountModelsCacheForTest().store;
+  assert.ok(before);
+  assert.equal((await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL)).kind, "model_unavailable");
+  const body = JSON.stringify({
+    models: [
+      null,
+      { slug: " " },
+      { slug: MODEL, supported_reasoning_levels: [{ effort: "ultra", description: "Native tier" }], default_reasoning_level: "ultra" },
+      { id: "another-model" },
+      { slug: MODEL },
+    ],
+    has_more: false,
+  });
+  const seen = { ifNoneMatch: "unset" as string | null, calls: 0 };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (_input, init) => {
+    seen.calls += 1;
+    const headers = new Headers(init?.headers);
+    seen.ifNoneMatch = headers.get("If-None-Match");
+    assert.equal(headers.get("ChatGPT-Account-ID"), accounts[0].account_id);
+    return Promise.resolve(new Response(body, { headers: { "Content-Type": "application/json", ETag: '"fresh-catalog"' } }));
+  };
+  try {
+    const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"old-catalog"' });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("ETag"), '"fresh-catalog"');
+    assert.equal(await response.text(), body, "the native response and reasoning tiers remain byte-identical");
+    assert.deepEqual(seen, { ifNoneMatch: '"old-catalog"', calls: 1 });
+    const store = getCodexAccountModelsCacheForTest().store;
+    assert.ok(store);
+    assert.deepEqual(store.accounts[accounts[0].account_id].slugs, [MODEL, "another-model"]);
+    assert.equal(store.accounts[accounts[0].account_id].client_version, "0.160.0");
+    assert.deepEqual(store.accounts.sibling, before.accounts.sibling, "a single-account refresh leaves sibling catalogs untouched");
+    assert.deepEqual(store.unsupported.sibling, before.unsupported.sibling, "a sibling's same-model rejection remains");
+    assert.equal(codexModelUnavailableAccounts("absent-model", [accounts[0].account_id]).has(accounts[0].account_id), true);
+    const selection = await selectCodexRoutingAccountsStrong({ accounts, updated_at_ms: 1 }, accounts, Date.now(), MODEL);
+    assert.equal(selection.kind, "eligible", "fresh advertisement restores real routing eligibility before rejection expiry");
+    assert.equal(selection.accounts[0].auth.account_id, accounts[0].account_id);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("codex models: a single-account 304, absent model or unusable catalog never clears a learned rejection", async () => {
+  seedPool([codexAccount("single-negative")]);
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [status, body] of [
+      [304, null],
+      [200, '{"models":[{"slug":"other-model"}]}'],
+      [200, "not json"],
+      [200, '{"data":[]}'],
+      [500, `{"models":[{"slug":"${MODEL}"}]}`],
+    ] as const) {
+      clearAvailabilityKv();
+      await recordCodexAccountCatalogs([{ accountId: "single-negative", clientVersion: "0.159.0", slugs: ["old-model"] }]);
+      await recordCodexModelUnsupported("single-negative", MODEL, { detail: UNSUPPORTED_DETAIL });
+      const before = getCodexAccountModelsCacheForTest().store;
+      assert.ok(before);
+      globalThis.fetch = () => Promise.resolve(new Response(body, { status, headers: { ETag: '"unchanged"' } }));
+      const response = await fetchCodexModels({ clientVersion: "0.160.0", ifNoneMatch: '"unchanged"' });
+      assert.equal(response.status, status);
+      assert.equal(response.headers.get("ETag"), '"unchanged"');
+      assert.equal(await response.text(), body ?? "");
+      assert.equal(codexModelUnavailableAccounts(MODEL, ["single-negative"]).get("single-negative"), UNSUPPORTED_DETAIL);
+      const after = getCodexAccountModelsCacheForTest().store;
+      assert.ok(after);
+      assert.deepEqual(after.unsupported, before.unsupported);
+      if (body !== '{"models":[{"slug":"other-model"}]}') assert.deepEqual(after.accounts, before.accounts, "only fresh catalogs record evidence");
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }

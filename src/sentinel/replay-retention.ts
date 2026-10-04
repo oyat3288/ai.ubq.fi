@@ -41,13 +41,12 @@ import {
   SENTINEL_REPLAY_STATUS_TTL_MS,
   SENTINEL_REPLAY_TTL_MS,
   type SentinelReplayCaptureStatusRow,
-  type SentinelReplayManifest,
 } from "./replay-model.ts";
 import { SENTINEL_REPLAY_MAX_RECORDS, SENTINEL_REPLAY_MAX_STATUS_RECORDS, sentinelReplayReservationBytes } from "./replay-limits.ts";
 import { isSentinelReplayCaptureStatusRow } from "./replay-observation.ts";
 import { isSentinelReplayManifest } from "./replay-read.ts";
 import { bootstrapBeforeMutation, releaseLegacyReservation, runBootstrapBatch } from "./replay-retention-bootstrap.ts";
-import { reconcileSentinelReplayStatusMetadata } from "./replay-retention-metadata.ts";
+import { metadataEntryMatches, reconcileSentinelReplayStatusMetadata } from "./replay-retention-metadata.ts";
 import {
   accountingKeyMatches,
   CAS_ATTEMPTS,
@@ -137,10 +136,10 @@ export const admitSentinelReplayStatusMetadata = async (
 
 type StatusCandidate = Readonly<{ key: Deno.KvKey; versionstamp: string; bytes: number; captured_at_ms: number }>;
 
-const statusCandidates = async (kv: Deno.Kv): Promise<StatusCandidate[]> => {
+const statusCandidates = async (kv: Deno.Kv): Promise<StatusCandidate[] | null> => {
   const candidates: StatusCandidate[] = [];
   for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_REQUEST_PREFIX }, { limit: STATUS_PRUNE_SCAN })) {
-    if (!isSentinelReplayCaptureStatusRow(entry.value)) continue;
+    if (!isSentinelReplayCaptureStatusRow(entry.value) || !metadataEntryMatches(entry, SENTINEL_REPLAY_REQUEST_PREFIX)) return null;
     candidates.push({
       key: entry.key,
       versionstamp: entry.versionstamp,
@@ -149,13 +148,13 @@ const statusCandidates = async (kv: Deno.Kv): Promise<StatusCandidate[]> => {
     });
   }
   for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_EVICTION_PREFIX }, { limit: STATUS_PRUNE_SCAN })) {
-    const value = entry.value as { evicted_at_ms?: unknown } | null;
-    if (typeof value !== "object" || value === null) continue;
+    if (!metadataEntryMatches(entry, SENTINEL_REPLAY_EVICTION_PREFIX)) return null;
+    const value = entry.value as { evicted_at_ms: number };
     candidates.push({
       key: entry.key,
       versionstamp: entry.versionstamp,
       bytes: sentinelReplayStatusMetadataBytes(value),
-      captured_at_ms: typeof value.evicted_at_ms === "number" ? value.evicted_at_ms : 0,
+      captured_at_ms: value.evicted_at_ms,
     });
   }
   return candidates.sort((left, right) => left.captured_at_ms - right.captured_at_ms);
@@ -178,7 +177,7 @@ export const pruneCaptureOwnedStatusMetadata = async (
   if (ledger.status_records + extraRecords <= SENTINEL_REPLAY_MAX_STATUS_RECORDS && ledger.metadata_bytes + extraBytes <= reserve) return 0;
   if ((await reconcileSentinelReplayStatusMetadata(kv, budgetBytes)) === "failed") return 0;
   let deleted = 0;
-  for (const candidate of await statusCandidates(kv)) {
+  for (const candidate of (await statusCandidates(kv)) ?? []) {
     if (deleted >= maxDeletes) break;
     const state = await readLedger(kv, budgetBytes);
     if (state.kind === "corrupt") break;
@@ -502,11 +501,13 @@ const recordSkipReason = async (kv: Deno.Kv, reason: string | null, nowMs: numbe
  * fingerprint, and a manifest that no longer matches the claim is left alone.
  */
 const deleteClaimedVictimPayload = async (kv: Deno.Kv, row: SentinelReplayAccountingRow, manifestKey: Deno.KvKey): Promise<void> => {
-  const manifestEntry = await kv.get<SentinelReplayManifest>(manifestKey);
-  if (!isSentinelReplayManifest(manifestEntry.value)) return;
-  if (!manifestKeyMatches(manifestKey, manifestEntry.value) || manifestEntry.value.fingerprint !== row.fingerprint) return;
-  fault("delete");
-  await kv.delete(manifestKey);
+  const manifestEntry = await kv.get(manifestKey);
+  if (manifestEntry.value !== null || manifestEntry.versionstamp !== null) {
+    if (!isSentinelReplayManifest(manifestEntry.value)) return;
+    if (!manifestKeyMatches(manifestKey, manifestEntry.value) || manifestEntry.value.fingerprint !== row.fingerprint) return;
+    fault("delete");
+    await kv.delete(manifestKey);
+  }
   const dedupeKey = [...SENTINEL_REPLAY_DEDUPE_PREFIX, row.fingerprint];
   const dedupeEntry = await kv.get<{ manifest_key?: unknown }>(dedupeKey);
   if (!Array.isArray(dedupeEntry.value?.manifest_key)) return;

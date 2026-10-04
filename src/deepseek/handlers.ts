@@ -29,7 +29,7 @@ import {
   normalizeDeepSeekChatCompletion,
 } from "./index.ts";
 import { DeepSeekStreamError, iterateDeepSeekChatCompletionStream } from "./stream.ts";
-import { DEEPSEEK_RESPONSES_PROFILE } from "./responses.ts";
+import { DEEPSEEK_RESPONSES_PROFILE, type OriginalToolName } from "./responses.ts";
 import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
 import { recordDeepSeekProviderHealth } from "../provider/health.ts";
 import {
@@ -335,13 +335,13 @@ const respondDeepSeekChatUpstreamHttpFailure = async (
   requestSignal: AbortSignal,
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,
-  body: Record<string, unknown>
+  bodyDiagnostic: Record<string, unknown> | undefined
 ): Promise<Response> => {
   recordDeepSeekResponseHealth(upstream.status, providerRequestId);
   recordDeepSeekFailureKind(usageContext, "upstream_http_error");
   recordStreamTerminalType(usageContext, "response.failed");
   await recordErrorUsage(usageContext);
-  return await toDeepSeekUpstreamErrorResponse(upstream, requestSignal, deepSeekChatBodyDiagnostic(body));
+  return await toDeepSeekUpstreamErrorResponse(upstream, requestSignal, bodyDiagnostic);
 };
 
 export const respondDeepSeekChatIncompleteCapture = async (
@@ -437,8 +437,12 @@ export const dispatchDeepSeekUpstream = async (
   const downstreamSignal = downstreamSignalFor(req, usageContext);
   const requestSignal = inferenceSignal(req, usageContext);
   let upstream: Response;
+  let bodyDiagnostic: Record<string, unknown> | undefined;
   try {
     upstream = await fetchDeepSeekChatCompletions(body, modelRaw, {
+      onProjectedBody: (projectedBody) => {
+        bodyDiagnostic = deepSeekChatBodyDiagnostic(projectedBody);
+      },
       signal: requestSignal,
       beforeDispatch: () => usageContext?.beforeProviderDispatch?.("deepseek") ?? Promise.resolve(undefined),
       onDispatch: () => {
@@ -457,7 +461,7 @@ export const dispatchDeepSeekUpstream = async (
   const providerRequestId = getDeepSeekProviderRequestId(upstream);
   if (usageContext?.responseTelemetry) usageContext.responseTelemetry.providerRequestId = providerRequestId;
   if (!upstream.ok) {
-    return { ok: false, response: await respondDeepSeekChatUpstreamHttpFailure(upstream, requestSignal, providerRequestId, usageContext, body) };
+    return { ok: false, response: await respondDeepSeekChatUpstreamHttpFailure(upstream, requestSignal, providerRequestId, usageContext, bodyDiagnostic) };
   }
   return { ok: true, upstream, providerRequestId, requestSignal, downstreamSignal };
 };
@@ -571,7 +575,7 @@ const finalizeBufferedDeepSeekResponses = async (
     modelRaw: string;
     responseId: string;
     echo: DeepSeekResponsesEcho;
-    toolNames: ReadonlyMap<string, string>;
+    toolNames: ReadonlyMap<string, OriginalToolName>;
     customToolNames: ReadonlySet<string>;
     upstreamModel: string;
     providerRequestId: string | null;
@@ -726,7 +730,7 @@ const streamDeepSeekResponses = (
   responseId: string,
   createdAtSeconds: number,
   echo: DeepSeekResponsesEcho,
-  toolNames: ReadonlyMap<string, string>,
+  toolNames: ReadonlyMap<string, OriginalToolName>,
   customToolNames: ReadonlySet<string>,
   providerRequestId: string | null,
   usageContext: UsageContext | undefined,

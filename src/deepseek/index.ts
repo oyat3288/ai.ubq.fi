@@ -215,6 +215,8 @@ export type DeepSeekChatCompletionsOptions = Readonly<{
   beforeDispatch?: (() => Promise<ApiKeyProviderDispatch>) | (() => void);
   onDispatch?: () => void;
   onHeaders?: () => void;
+  /** Observes the exact projected body serialized for this dispatch, before any admission await. */
+  onProjectedBody?: (body: Record<string, unknown>) => void;
   /** Request-owned passive recorder; best effort, never required. */
   sentinelUpstreamRecorder?: SentinelUpstreamRecorder;
 }>;
@@ -288,7 +290,7 @@ const requireDeepSeekApiKey = (supplied: string | null | undefined): string => {
  */
 export const deepSeekUpstreamModelFor = (model: string): string | null => {
   const normalized = model.trim().toLowerCase();
-  return DEEPSEEK_UPSTREAM_MODEL_BY_ID[normalized] ?? null;
+  return Object.hasOwn(DEEPSEEK_UPSTREAM_MODEL_BY_ID, normalized) ? DEEPSEEK_UPSTREAM_MODEL_BY_ID[normalized] : null;
 };
 
 /** Maps a requested reasoning tier onto the documented DeepSeek wire tier. */
@@ -389,8 +391,10 @@ export const fetchDeepSeekChatCompletions = async (
   options: DeepSeekChatCompletionsOptions = {}
 ): Promise<Response> => {
   let encodedBody: string;
+  let projectedBody: Record<string, unknown>;
   try {
-    encodedBody = JSON.stringify(projectDeepSeekRequest(body, requestedModel));
+    projectedBody = projectDeepSeekRequest(body, requestedModel);
+    encodedBody = JSON.stringify(projectedBody);
   } catch (error) {
     if (error instanceof DeepSeekError) throw error;
     throw new DeepSeekError("Chat Completions requests must use a JSON-serializable body.", "deepseek_request_invalid", 400);
@@ -398,6 +402,8 @@ export const fetchDeepSeekChatCompletions = async (
   if (typeof encodedBody !== "string") {
     throw new DeepSeekError("Chat Completions requests must use a JSON-serializable body.", "deepseek_request_invalid", 400);
   }
+
+  options.onProjectedBody?.(projectedBody);
 
   const apiKey = requireDeepSeekApiKey(options.apiKey);
   const headers = new Headers({

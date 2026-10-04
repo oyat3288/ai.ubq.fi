@@ -2,6 +2,7 @@
 
 import { type CodexModelsSnapshot, mergeCodexModelPromptCacheCapabilities, parseCodexClientVersion } from "./codex-models.ts";
 import { getKv } from "../kv.ts";
+import { readBoundedResponseBody } from "../bounded-response-body.ts";
 import { buildRuntimeConfig, cacheRuntimeConfig, loadRuntimeConfig, normalizeRuntimeConfig, RUNTIME_CONFIG_V2_KEY } from "../runtime-config.ts";
 import { getString, isRecord } from "../utils.ts";
 import type { CodexAuthState, ResponseInputItem } from "../types.ts";
@@ -17,6 +18,9 @@ import {
   recordCodexThrownHealth,
 } from "../codex/dispatch.ts";
 import { recordCodexAccountCatalogs } from "./codex-models-availability.ts";
+
+const SINGLE_ACCOUNT_CATALOG_MAX_BYTES = 4 * 1024 * 1024;
+const SINGLE_ACCOUNT_CATALOG_TIMEOUT_MS = 1_000;
 
 const fetchCodexModelsForAccount = async (
   accountEntry: CodexAuthAccountEntry,
@@ -87,6 +91,7 @@ const fetchCodexModelsFromAccounts = async (
       fallback = res;
       break;
     }
+    await recordSingleAccountCodexCatalog(res, accountEntry.auth.account_id, clientVersion);
     return { kind: "response", response: res };
   }
   return { kind: "next_url", fallback };
@@ -230,6 +235,25 @@ const readCodexModelsJsonBody = async (res: Response): Promise<Record<string, un
   }
 };
 
+/** Record fresh single-account evidence without consuming or rewriting its upstream response. */
+const recordSingleAccountCodexCatalog = async (res: Response, accountId: string, clientVersion: string): Promise<void> => {
+  if (!res.ok) return;
+  const observation = await readBoundedResponseBody(res.clone(), {
+    maxBytes: SINGLE_ACCOUNT_CATALOG_MAX_BYTES,
+    timeoutMs: SINGLE_ACCOUNT_CATALOG_TIMEOUT_MS,
+  });
+  if (!observation.complete) return;
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder().decode(observation.bytes)) as unknown;
+  } catch {
+    return;
+  }
+  if (!isRecord(body) || !Array.isArray(body.models)) return;
+  const contribution = contributionFromBody(accountId, body);
+  await recordCodexAccountCatalogs([{ accountId, clientVersion, slugs: contribution.slugs }]);
+};
+
 type CodexAccountCatalogAttempt = Readonly<{ catalog: CodexAccountCatalogContribution | null; fallback: Response | null }>;
 
 /**
@@ -325,10 +349,8 @@ const buildCodexModelsUnionResponse = (contributions: readonly CodexAccountCatal
   for (const contribution of contributions) {
     for (const model of contribution.models) {
       const slug = codexModelRowSlug(model);
-      if (slug !== null) {
-        if (seen.has(slug)) continue;
-        seen.add(slug);
-      }
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
       models.push(model);
     }
   }
@@ -373,8 +395,9 @@ export const preserveCodexDefaultModel = (snapshot: CodexModelsSnapshot, candida
 export const loadFullCodexModelsSnapshot = async (kvOverride?: Deno.Kv | null): Promise<CodexModelsSnapshot | null> => {
   const kv = kvOverride === undefined ? await getKv() : kvOverride;
   if (!kv) return null;
-  const entry = await kv.get<CodexModelsSnapshot>(CODEX_MODELS_KV_KEY, { consistency: "strong" });
-  const snapshot = entry.value;
+  // This optional snapshot may be unavailable while the runtime catalog still serves.
+  const entry = await kv.get<CodexModelsSnapshot>(CODEX_MODELS_KV_KEY, { consistency: "strong" }).catch(() => null);
+  const snapshot = entry?.value;
   if (!snapshot || !Array.isArray(snapshot.models) || snapshot.models.length === 0) return null;
   if (snapshot.models.some((model) => !isRecord(model))) return null;
   if (!getString(snapshot.source)?.trim()) return null;

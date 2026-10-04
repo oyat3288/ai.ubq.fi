@@ -6,6 +6,106 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## The Mac gateway uses a checksum-pinned managed Deno 2.9.5 - 2026-10-03
+
+Only the Mac gateway launcher uses the official aarch64 Deno 2.9.5 artifact in
+`.data/runtimes/deno/2.9.5-b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa/deno`. Released Deno 2.9.6
+and 2.9.7 split read/write permission lists without decoding doubled commas, which breaks literal comma paths in
+`CODEX_HOME`; 2.9.5 retains that decoder. This is a service-specific compatibility rollback, not a global downgrade, and
+omits the later releases' fixes. CI remains pinned to 2.9.5. The released-source comparison is retained in the issue
+#812 runtime prerequisite record, with exact commits `17fadf33a8df3af9488b9f42efd1f2290d6dc7a3` (2.9.5) and
+`0c071246a412575e07423263404a5d13e7ed6aa2` (2.9.7).
+
+The fixed official archive SHA-256 is `b796aadd131f6930560c1ee040cf0d6f53933fbb987464e9ff46bd7ea4830615`; the extracted
+binary SHA-256 is `b5bd08edab254d42d7b05aa5b6cb4c9b8d4dede4975aff76951ce2cce18866fa`. Deployment prepares and verifies
+this immutable path under the existing deployment lock before release selection or service interruption, refuses corrupt
+or symlink destinations, and publishes only completed verified bytes. The launcher checks the binary again, uses it for
+both the dotenv-loading task and frozen application, selects the physical release's configuration, preserves literal
+native-home permissions and limits native writes to `app-server-control`. The application denies writes to
+`.data/runtimes`; missing or corrupt runtime state fails closed without falling back to the global binary.
+
+Existing synthetic proof: runtime preparation and actual disposable deploy ordering passed 14 tests in receipt
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/4fa44cf3-59d5-4fa1-9b5b-dadc5685e414`; the actual
+managed launcher passed all 11 native-home, configuration/lock, write-denial, failure and shutdown cases in
+`591bceabb6cc0ae63ee09ee9914b02c17ad0b9b53f9be3f4389670cde15755a5/6ac18d06-c49d-438e-a398-b22be79ddd65`. A disposable
+native KV roundtrip seeded with 2.9.7, updated with 2.9.5 and reread with 2.9.7 preserved exact values and rejected
+stale CAS, with every child and KV handle settled; its result is
+`.codex-worktrees/plan-issue-812-abcb41d3034/.data/issue-812/kv-compatibility/roundtrip-result.json`. These proofs cover
+synthetic state, not the live gateway database or service.
+
+The normal test task adds three separate scoped Mac fixtures, retaining all existing suite segments and permissions. The
+launcher matrix must execute 2.9.5, including on Linux: only its disposable runtime coordinates and checksum comparison
+are substituted, and comma, symlink, absent-directory and runtime-write-denial cases remain required. Running that
+matrix with 2.9.7 must report the unsupported runtime rather than skip assertions. The existing `verify.sh` task call
+and CI test call include these fixtures without duplicate invocations or new tasks.
+
+Status: source and focused synthetic evidence accepted for integration; committed combined verification and
+whole-gateway synthetic acceptance remain required. Preparing the runtime in the canonical store or adopting it through
+live `deploy:mac`/launchd requires the separately approved concrete rollout. This decision authorizes no global binary
+or PATH change, other service downgrade, real credential mutation, live database probe, automatic upgrade, runtime
+fallback or runtime-store pruning. Reversal risk: restoring the global 2.9.6/7 launcher breaks escaped native-home
+paths; removing integrity checks or the runtime write denial lets the service use or alter an unverified executable.
+
+## Codex collaboration tools work over the Chat-only routes - 2026-10-03
+
+Codex clients expose the multi-agent tools (`spawn_agent`, `followup_task`, `send_message`, `wait_agent`,
+`interrupt_agent`, `list_agents`) as a single `namespace` tool named `collaboration`, and resolve a returned call by its
+`(namespace, name)` pair. The Chat-only projection behind the DeepSeek, LithosAI, and Cerebras routes flattened
+namespace groups into bare Chat function names and returned only a name, so every call for a namespaced tool reached the
+client unqualified and failed as `unsupported call: spawn_agent` even though the tool had been delivered to the model.
+Three changes to that one adapter fixed the loop, all deployed as Mac release `92493574`:
+
+1. `ee641318` stores `{name, namespace}` for every namespace-grouped function, not only for renamed collisions, and both
+   response emitters write `namespace` on `function_call` items.
+2. `963f44d9` projects an `agent_message` input item (author, recipient, content) onto a user turn that names both
+   endpoints. Before this the projection rejected every input type other than `message`, so a parent turn failed with
+   `input item type 'agent_message' is not supported` as soon as a sub-agent answered.
+3. `92493574` forwards an unsealed `encrypted_content` agent-message payload verbatim and marks a Fernet-shaped payload
+   (`gAAAAA` prefix, at least 100 characters) as omitted. On these routes the client moves the payload text into that
+   field in the clear, so dropping it left every sub-agent with an empty task and its own "payload arrived
+   encrypted/unreadable" report.
+
+Evidence on 2026-10-03, against the local Mac service: `spawn_agent` returns `{"task_name":"/root/<name>"}` from a
+deepseek parent for both a deepseek child and a `qwen-3.8-27b` child; a deepseek worker received its task, wrote its
+handoff file, and the parent read `pong` back from disk; separately a parent received a worker's mailbox reply `pong`
+without any file handoff. Measured overhead: 884 ms from tool call to spawn result and 192 ms more until the child's
+first turn.
+
+Cross-backend delegation does not carry a payload (measured 2026-10-03). A parent whose model is served by the Codex
+backend (`gpt-6-astra`, `gpt-6.1-sol`) emits the spawn message as a sealed Fernet token (`gAAAAA...`), because that
+backend seals every `encrypted: true` tool argument and only it can open the seal. A gateway-served child therefore
+receives an empty task: two `deepseek-ai/DeepSeek-V4.1-Flash-ultra` children of a `gpt-6-astra` parent reported the
+assignment arrived as an unreadable blob, and neither edited a file (`agent_message` items carried the plaintext
+envelope and a sealed `encrypted_content` part that this gateway correctly marks omitted). Delegation payloads survive
+only when both ends are served by the same backend: gateway parent to gateway child (deepseek or qwen) works, Codex
+parent to Codex child works, and a cross-backend assignment needs an out-of-band handoff. Gateway-side unsealing is not
+available: forwarding the same tool schemas with the `encrypted` annotation removed is rejected by the Codex backend
+("Invalid Value: 'tools'. Function 'collaboration.followup_task' is reserved for use by this model and must match the
+configured schema."), so the annotation is enforced server-side and only a client-side change could carry a
+cross-backend payload another way. The recorded convention is a file at `/tmp/codex-agent-tasks/<task_name>.md` written
+by the parent before the spawn and read by the child first, which works because the plaintext envelope still carries the
+task name and sender.
+
+Limits recorded with the same evidence: a sealed payload from a ChatGPT-backed thread stays opaque to this gateway
+because the opening key lives in that backend and the client implements no such crypto, so it is declared rather than
+invented; a sub-agent receives no collaboration tools in this client build, so fan-out depth is 1; `qwen-3.8-27b`
+rejects `reasoning_effort: max` (none/low/medium/high only) and its Cerebras quota can be exhausted, so an orchestrator
+should retry a rate-limited child with a deepseek model; and a child is aborted when its parent session exits, so the
+parent must wait for it.
+
+To re-verify the loop, run a headless session on the orchestrator model that spawns a child, waits for it, and prints
+what it received; the client-side knobs that matter are `[agents] default_subagent_model` and
+`default_subagent_reasoning_effort` in `~/.codex/config.toml`, where a `max` default serves deepseek children and is
+rejected by `qwen-3.8-27b`. The Mac service deploys from a clean canonical checkout with `deno task deploy:mac`, which
+snapshots HEAD into `.data/releases/<sha>` and restarts the launch agent; client builds are never patched.
+
+Reason: the owner asked for deepseek orchestrators that spawn deepseek and Qwen workers through this gateway, after
+`spawn_agent` failed with `unsupported call: spawn_agent` on every attempt.
+
+Reversal risk: reverting any one change restores its exact failure (`unsupported call: spawn_agent`, `agent_message`
+request rejection, or empty child tasks). If a future client seals payloads locally the `gAAAAA` heuristic would forward
+ciphertext as text until the marker is updated.
+
 ## Analytics drops the Quota forecast card and the Metered capacity panels - 2026-10-03
 
 The admin Analytics view no longer renders the "Quota forecast" (quota runway) card, and the Provider analytics card
@@ -1156,3 +1256,35 @@ Decision evidence: DSH session-8d0f4b3a-9ab5-43e1-96e6-fd092c509c26, recovered d
 
 For the recorded cleanup, delete unused p-ai-ubq-fi and ai-ubq-fi-feat-shared-admin-toke. Retain ai-ubq-fi and
 ubiquity-prospector; the Prospector monorepo's own `DECISIONS.md` owns the latter's retention and migration decisions.
+
+## Local-development key deletion ownership - 2026-10-03
+
+For the local-development API key only, the retained paid-deletion guard keeps created_at_ms and adds local_deletion
+with an exclusive owner and completed_at_ms. Admin deletion CAS-claims ownership while the revoked ID exists, checks
+that claim before deleting the ID, and publishes completion only after all awaited paid-state, request-log, counter and
+V3 usage cleanup finishes, using the same owner version and an absent-ID CAS. A known settled pre-ID refusal or failure
+may release only its own claim for explicit admin retry; legacy and crashed active guards remain blocked without owner
+stealing. Startup reprovision requires a completed local marker, no outstanding billing, pending markers, lease or
+remaining cleanup rows, and atomically checks the absent ID, token hash and unchanged guard while publishing the
+replacement and clearing only that local guard. Empty prefixes and an absent ID alone never prove completion; every
+nonlocal guard keeps its existing meaning.
+
+## Client catalog ETags - 2026-10-03
+
+Client catalog ETags are hashes of the final bytes served to that client, in both the fast path and the assembled path.
+Raw upstream ETags remain source metadata used only for upstream conditional fetches. Enrichment that changes the served
+body changes its client validator even when upstream metadata is unchanged; only a validator for the current served body
+permits a client 304 response.
+
+## Supported VPS activation recovery - 2026-10-03
+
+For supported VPS releases, same-SHA retry uses a private atomic deployment-owned recovery receipt under the existing
+deploy lock, binding the candidate and previous full SHA, source archive and complete immutable tree digests, exact
+selectors, verified fixed listener port and known launcher/unit profile. Before ingress changes, a failed candidate
+restores the supported previous selector and actual listener/public identity; daemon-reload refusal restores only the
+selector and issues no gateway restart. After successful ingress reload, a public verification failure retains the ready
+candidate and ingress-applied intent for nondestructive same-SHA verification retry. Candidate bytes remain immutable,
+and pruning occurs only after exact loopback and public identity acceptance. Unsupported or historical root-relative
+launchers are refused before destructive activation; successful historical restoration and first-deployment rollback
+remain separate unresolved scopes. The normal deployment command must permit the verified prior loopback port, and
+verify/CI must provide the scoped shell and loopback capabilities required by every actual launcher fixture.

@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 
 import { LITHOS_CHAT_COMPLETIONS_URL, LITHOS_MODEL_IDS, LITHOS_RATE_LIMIT_HEADERS } from "../src/provider/lithos.ts";
-import { clearLithosFailoverWindows, lithosRateLimitSnapshot, lithosRateLimitWait } from "../src/provider/lithos-rate-limits.ts";
+import {
+  clearLithosFailoverWindows,
+  lithosFailoverTargetAt,
+  lithosOpenFailoverWindow,
+  lithosRateLimitSnapshot,
+  lithosRateLimitWait,
+  waitForLithosRetry,
+} from "../src/provider/lithos-rate-limits.ts";
 import { setKvForTest } from "../src/kv.ts";
 import { handleResponses } from "../src/responses-handler.ts";
 import { handleChatCompletions } from "../src/chat/envelope.ts";
@@ -744,6 +751,137 @@ Deno.test("lithos rate-limit waits follow the vendor's own header precedence", (
   assert.equal(wait({}), null);
 });
 
+Deno.test("lithos rate-limit numeric headers reject nonfinite waits and retain finite precedence", () => {
+  const oversizedDigits = "9".repeat(309);
+  const overflowSeconds = "9".repeat(308);
+  const wait = (headers: Record<string, string>) => lithosRateLimitWait(new Headers(headers), 1_000);
+  assert.equal(Number.isFinite(Number(oversizedDigits)), false);
+  assert.equal(Number.isFinite(Number(overflowSeconds)), true);
+  assert.equal(wait({ "retry-after-ms": oversizedDigits }), null);
+  assert.equal(wait({ "retry-after": oversizedDigits }), null);
+  assert.equal(wait({ "retry-after": overflowSeconds }), null);
+  assert.equal(wait({ "x-ratelimit-reset-tokens": `${oversizedDigits}s` }), null);
+  assert.deepEqual(wait({ "retry-after-ms": oversizedDigits, "retry-after": "9", "x-ratelimit-reset-tokens": "30s" }), {
+    waitMs: 9_000,
+    source: "retry-after",
+  });
+  assert.deepEqual(wait({ "retry-after": overflowSeconds, "x-ratelimit-reset-tokens": "1.25s", "x-ratelimit-reset-requests": "750ms" }), {
+    waitMs: 1_250,
+    source: "x-ratelimit-reset-tokens",
+  });
+  assert.deepEqual(wait({ "retry-after-ms": overflowSeconds }), { waitMs: Number(overflowSeconds), source: "retry-after-ms" });
+  assert.deepEqual(wait({ "retry-after-ms": "90000", "retry-after": "120" }), { waitMs: 90_000, source: "retry-after-ms" });
+});
+
+Deno.test("lithos rate-limit numeric windows reject nonfinite deadlines and keep finite expiry", () => {
+  clearLithosFailoverWindows();
+  try {
+    for (const waitMs of [Infinity, -Infinity, NaN]) {
+      lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, waitMs, LITHOS_SIBLING_MODEL);
+      assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 1_000), null);
+    }
+    lithosOpenFailoverWindow(LITHOS_MODEL, Number.MAX_VALUE, Number.MAX_VALUE, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, Number.MAX_VALUE), null);
+
+    // Sticky routing follows a finite vendor window even beyond the inline wait cap.
+    lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, 90_000, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 1_000), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 90_999), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 91_000), null);
+  } finally {
+    clearLithosFailoverWindows();
+  }
+});
+
+Deno.test("lithos refusal windows select the highest recovered rung at its own deadline", () => {
+  clearLithosFailoverWindows();
+  try {
+    lithosOpenFailoverWindow(LITHOS_MODEL, 1_000, 60_000, LITHOS_SIBLING_MODEL);
+    lithosOpenFailoverWindow(LITHOS_MODEL, 2_000, 1_000, LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 3_001), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 60_999), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 61_000), null);
+
+    // An expired window does not extend a fresh short refusal.
+    lithosOpenFailoverWindow(LITHOS_MODEL, 61_000, 1_000, LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 61_999), LITHOS_SIBLING_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 62_000), null);
+
+    lithosOpenFailoverWindow(LITHOS_MODEL, 100_000, 60_000, LITHOS_SIBLING_MODEL);
+    lithosOpenFailoverWindow(LITHOS_MODEL, 101_000, 120_000, LITHOS_BASE_MODEL);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 160_000), null);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 220_999), null);
+    assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, 221_000), null);
+  } finally {
+    clearLithosFailoverWindows();
+  }
+});
+
+Deno.test("lithos refusal windows preserve each rung's own reset in handler routing", async (t) => {
+  await withLithosKey(async () => {
+    const originalNow = Date.now;
+    try {
+      for (const waitMs of [1_000, 120_000]) {
+        await t.step(`60s then ${waitMs}ms refusal`, async () => {
+          clearLithosFailoverWindows();
+          const initialNowMs = originalNow();
+          let nowMs = initialNowMs;
+          Date.now = () => nowMs;
+          const message = [{ role: "user", content: "hi" }];
+          const first = await withUpstream(
+            (_call, calls) => {
+              if (calls.length === 1) return lithosRateLimitRefusal("60000");
+              if (calls.length === 2) {
+                nowMs = initialNowMs + 1_000;
+                return lithosRateLimitRefusal(String(waitMs));
+              }
+              return Response.json(lithosCompletion({ role: "assistant", content: "base-served" }, LITHOS_BASE_MODEL));
+            },
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-overlap"))
+          );
+          assert.deepEqual(
+            first.calls.map((call) => call.body.model),
+            [LITHOS_MODEL, LITHOS_SIBLING_MODEL, LITHOS_BASE_MODEL]
+          );
+          assert.equal(first.result.status, 200);
+          await first.result.json();
+
+          nowMs = initialNowMs + 2_001;
+          const second = await withUpstream(
+            (call) => Response.json(lithosCompletion({ role: "assistant", content: "served" }, String(call.body.model))),
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-retained"))
+          );
+          assert.deepEqual(
+            second.calls.map((call) => call.body.model),
+            [waitMs === 1_000 ? LITHOS_SIBLING_MODEL : LITHOS_BASE_MODEL],
+            "the highest recovered rung is selected"
+          );
+          assert.equal(second.result.status, 200);
+          await second.result.json();
+
+          const resetAtMs = initialNowMs + 60_000;
+          assert.equal(lithosFailoverTargetAt(LITHOS_MODEL, resetAtMs - 1), second.calls[0].body.model);
+          nowMs = resetAtMs;
+          const third = await withUpstream(
+            () => Response.json(lithosCompletion({ role: "assistant", content: "ultra-after-reset" })),
+            () => handleChatCompletions(chatRequest({ model: LITHOS_MODEL, messages: message, stream: false }), usageContext("lithos-window-expired"))
+          );
+          assert.deepEqual(
+            third.calls.map((call) => call.body.model),
+            [LITHOS_MODEL],
+            "the requested tier resumes at its own reset"
+          );
+          assert.equal(third.result.status, 200);
+          await third.result.json();
+        });
+      }
+    } finally {
+      Date.now = originalNow;
+      clearLithosFailoverWindows();
+    }
+  });
+});
+
 Deno.test("lithos rate-limit snapshots capture the vendor's own budgets, bounded", () => {
   const snapshot = lithosRateLimitSnapshot(
     new Headers({
@@ -861,6 +999,59 @@ Deno.test("lithos wiring: a refusal on both tiers is absorbed by the vendor's ow
       assert.equal(telemetry.rateLimitWaitMs, 120, "the absorbed window is reported");
     } finally {
       clearLithosFailoverWindows();
+    }
+  });
+});
+
+Deno.test("lithos wiring: retry waits preserve deadline and caller cancellation without dispatching again", async (t) => {
+  await withLithosKey(async () => {
+    for (const route of ["chat", "responses"]) {
+      for (const timing of ["already", "during"]) {
+        for (const kind of ["deadline", "cancellation"]) {
+          await t.step(`${route} ${timing} ${kind}`, async () => {
+            const controller = new AbortController();
+            const reason = new DOMException("Retry wait fixture", kind === "deadline" ? "TimeoutError" : "AbortError");
+            const originalTimeout = Object.getOwnPropertyDescriptor(AbortSignal, "timeout");
+            const abort = () => {
+              controller.abort(reason);
+            };
+            // Inject the gateway deadline independently of the caller's signal.
+            if (kind === "deadline") AbortSignal.timeout = () => controller.signal;
+            try {
+              const request = new Request(
+                route === "chat"
+                  ? chatRequest({ model: LITHOS_BASE_MODEL, messages: [{ role: "user", content: "hi" }], stream: false })
+                  : responsesRequest({ model: LITHOS_BASE_MODEL, input: "hi", stream: false }),
+                { signal: kind === "cancellation" ? controller.signal : null }
+              );
+              const { result, calls } = await withUpstream(
+                () => {
+                  if (timing === "already") abort();
+                  else setTimeout(abort, 0);
+                  return lithosRateLimitRefusal("10000");
+                },
+                () =>
+                  route === "chat"
+                    ? handleChatCompletions(request, usageContext(`lithos-wait-${route}-${timing}-${kind}`))
+                    : handleResponses(request, usageContext(`lithos-wait-${route}-${timing}-${kind}`))
+              );
+              assert.equal(result.status, kind === "deadline" ? 504 : 499);
+              const body = (await result.json()) as { error?: { code?: string } };
+              assert.equal(body.error?.code, kind === "deadline" ? "gateway_timeout" : "request_cancelled");
+              assert.equal(calls.length, 1, "the refused request is never retried after abort");
+              assert.equal(calls[0].url, LITHOS_CHAT_COMPLETIONS_URL);
+              const telemetry = getResponseTelemetry(result);
+              if (telemetry === null) throw new Error("The retry-wait terminal carries no telemetry.");
+              assert.equal(telemetry.failureKind, kind);
+              assert.equal(telemetry.streamTerminalType, kind === "deadline" ? "deadline" : "cancelled");
+              assert.equal(telemetry.rateLimitWaitMs, 10_000, "the handler reached the vendor retry wait");
+              await assert.rejects(waitForLithosRetry(10_000, controller.signal), (error) => error === reason);
+            } finally {
+              if (originalTimeout !== undefined) Object.defineProperty(AbortSignal, "timeout", originalTimeout);
+            }
+          });
+        }
+      }
     }
   });
 });
