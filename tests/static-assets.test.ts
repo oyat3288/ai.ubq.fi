@@ -374,7 +374,10 @@ Deno.test("admin analytics view places capacity history before current providers
   assert.match(adminHtml, /id="view-tab-analytics"[\s\S]*?>\s*Analytics\s*</);
   assert.doesNotMatch(adminHtml, /Fifteen-minute capacity, cached-input, and cache-write history/);
   assert.match(adminHtml, /admin\.css\?v=passport-design-20260922/);
-  assert.match(adminHtml, /admin\.js\?v=admin-permissions-20261005/);
+  assert.match(adminHtml, /admin\.js\?v=admin-diagnostics-polish-20261005/);
+  assert.match(adminScript, /toLocaleString\(undefined,/);
+  assert.match(adminScript, /timeZoneName: "short"/);
+  assert.match(adminScript, /creditExpiries/);
   assert.match(adminHtml, /admin-supervisor\.css\?v=admin-permissions-20261005/);
   assert.doesNotMatch(adminScript, /super-admin/);
   assert.doesNotMatch(adminHtml, /removed_provider-failover|debug-routing/);

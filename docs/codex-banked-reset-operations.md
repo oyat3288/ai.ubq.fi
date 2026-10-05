@@ -95,8 +95,9 @@ changes another account's routing.
 The Providers diagnostics panel shows the banked-reset credit expiries (`credits` on the reset-settings GET, earliest
 first, with raw credit ids never included) and, when the upstream usage read succeeds, the account's overage balance
 string plus the `overage_limit_reached` flag from `GET /admin/providers/codex/overage-usage`. Both reads share the
-five-second bound; an unavailable or malformed upstream reports nulls instead of stale or zero values, and the switch
-itself renders as a plain `true`/`false` state.
+five-second bound; an unavailable or malformed upstream reports nulls instead of stale or zero values, each credit
+expiry renders as a list item in the viewer's local time zone with a day hint, and the switch itself renders as a plain
+`true`/`false` state.
 
 Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the ordinary
 retryable error in place. Malformed or unavailable durable routing state also fails retryably before dispatch; the
