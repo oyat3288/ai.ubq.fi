@@ -577,7 +577,7 @@ Deno.test("brief output parsing accepts only a grounded {about,status} object", 
   assert.equal(parseSupervisorBriefOutput(null), null);
 });
 
-Deno.test("the brief route stays behind super-admin auth in the real router", async () => {
+Deno.test("the brief route stays behind admin auth in the real router", async () => {
   const response = await handler(
     new Request("https://ai.ubq.fi/admin/codex/supervisor/brief", {
       method: "POST",
@@ -585,5 +585,5 @@ Deno.test("the brief route stays behind super-admin auth in the real router", as
       body: JSON.stringify({ source: "local", id: "thread-1" }),
     })
   );
-  assert.equal(response.status, 401, "an unauthenticated brief request reaches the super-admin gate instead of reading a transcript");
+  assert.equal(response.status, 401, "an unauthenticated brief request reaches the admin gate instead of reading a transcript");
 });

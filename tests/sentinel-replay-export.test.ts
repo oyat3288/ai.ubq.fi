@@ -234,7 +234,7 @@ Deno.test("anonymous replay-captures requests are rejected before any storage ac
 });
 
 Deno.test({
-  name: "an authenticated non-super-admin is rejected before the replay export",
+  name: "an authenticated admin passkey reaches the replay export",
   ignore: !kvAvailable,
   sanitizeResources: false,
   sanitizeOps: false,
@@ -266,10 +266,11 @@ Deno.test({
           headers: { Cookie: `${PASSKEY_RELAY_COOKIE_NAME}=${encodeURIComponent(sessionToken)}` },
         })
       );
-      assert.equal(response.status, 403);
-      const payload = (await response.json()) as { error?: { message?: string; code?: string } };
-      assert.equal(payload.error?.message, "Super admin token required");
-      assert.equal(payload.error.code, "forbidden");
+      // The former super-admin gate is gone: an admin passkey session now
+      // reads the same bounded export a token admin reads.
+      assert.equal(response.status, 200);
+      const payload = (await response.json()) as { data?: unknown };
+      assert.equal(Array.isArray(payload.data), true);
     } finally {
       kv.close();
       setKvForTest(null);

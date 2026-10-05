@@ -83,7 +83,7 @@ const matchesFilters = (session, filters) => {
   return haystack.includes(needle);
 };
 
-export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }) => {
+export const createSupervisorView = ({ section, getToken, apiUrl }) => {
   const pick = (id) => section.querySelector(`#${id}`);
   const badge = pick("supervisor-badge");
   const updated = pick("supervisor-updated");
@@ -189,7 +189,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
   };
 
   const loadProviders = async () => {
-    if (!active || !isSuperAdmin()) return;
+    if (!active) return;
     const token = typeof getToken === "function" ? getToken() : "";
     const headers = token ? { Authorization: `Bearer ${token}` } : {};
     try {
@@ -605,7 +605,6 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
 
   const startFollow = async (session) => {
     stopFollow();
-    if (!isSuperAdmin()) return;
     const key = `${session.sourceId}:${session.id}`;
     followKey = key;
     followSeen = new Map();
@@ -691,7 +690,6 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
   };
 
   const startBrief = async (session) => {
-    if (!isSuperAdmin()) return;
     const key = `${session.sourceId}:${session.id}`;
     // A second click while the same brief is loading is ignored; a click on a
     // different session replaces the in-flight one.
@@ -734,7 +732,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
   };
 
   const load = async () => {
-    if (!active || !isSuperAdmin()) return;
+    if (!active) return;
     void loadProviders();
     if (controller) controller.abort();
     const request = new AbortController();
@@ -781,7 +779,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
 
   const tick = () => {
     if (!active) return;
-    if (!isSuperAdmin() || section.hidden) {
+    if (section.hidden) {
       setActive(false);
       return;
     }
@@ -869,7 +867,7 @@ export const createSupervisorView = ({ section, isSuperAdmin, getToken, apiUrl }
   }
 
   const setActive = (next) => {
-    const wanted = next === true && isSuperAdmin();
+    const wanted = next === true;
     if (wanted === active) return;
     active = wanted;
     if (!active) {

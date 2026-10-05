@@ -1,15 +1,15 @@
 # Codex supervisor panel
 
-The supervisor panel is a read-only, super-admin-only view of Codex sessions on the machines an operator has configured.
-It answers one question: which Codex sessions exist, which are running right now, and what is each one waiting on.
+The supervisor panel is a read-only, admin-only view of Codex sessions on the machines an operator has configured. It
+answers one question: which Codex sessions exist, which are running right now, and what is each one waiting on.
 
 It never steers a session. The panel connects to each machine's existing Codex app-server control socket, sends only the
 read methods listed below, and always closes its own websocket. It does not resume, start, load, unsubscribe, approve,
 interrupt, archive, or otherwise mutate a thread, and it never launches SSH, manages daemons, or reads history databases
 or rollout files.
 
-Reach it at `/admin#supervisor`. The tab is hidden for anyone who is not a super admin, and both backend routes
-(`GET /admin/codex/supervisor/sessions` and `GET /admin/codex/supervisor/output`) enforce `requireSuperAdminAuth`
+Reach it at `/admin#supervisor`. Every signed-in admin sees the tab, and both backend routes
+(`GET /admin/codex/supervisor/sessions` and `GET /admin/codex/supervisor/output`) require admin authentication
 independently of the UI.
 
 ## Configuration

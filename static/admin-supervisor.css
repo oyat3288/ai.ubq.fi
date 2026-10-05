@@ -3,7 +3,7 @@
    restate only what differs here: a nested surface, a tighter rhythm, and a two-line title
    so a long prompt reads as prose instead of one clipped line. */
 
-body[data-page="admin"]:not([data-auth-scope="super-admin"]) #view-tab-supervisor {
+body[data-page="admin"]:not([data-auth-scope="admin"]) #view-tab-supervisor {
   display: none;
 }
 

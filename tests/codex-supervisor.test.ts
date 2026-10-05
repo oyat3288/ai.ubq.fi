@@ -129,11 +129,11 @@ Deno.test("parseFollowCursor round-trips turn ids that contain separators", () =
   assert.equal(parseFollowCursor("turn_1:x"), null);
 });
 
-Deno.test("the supervisor routes stay behind super-admin auth in the real router", async () => {
+Deno.test("the supervisor routes require admin auth in the real router", async () => {
   const sessions = await handler(new Request("https://ai.ubq.fi/admin/codex/supervisor/sessions"));
-  assert.equal(sessions.status, 401, "an unauthenticated session read reaches the super-admin gate instead of sampling sources");
+  assert.equal(sessions.status, 401, "an unauthenticated session read reaches the admin gate instead of sampling sources");
   const output = await handler(new Request("https://ai.ubq.fi/admin/codex/supervisor/output?source=local&id=thread-1"));
-  assert.equal(output.status, 401, "an unauthenticated follow read reaches the super-admin gate");
+  assert.equal(output.status, 401, "an unauthenticated follow read reaches the admin gate");
 });
 
 Deno.test("remote rows use verified live thread fields and keep token usage unavailable", () => {

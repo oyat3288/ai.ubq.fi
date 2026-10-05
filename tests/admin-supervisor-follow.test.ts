@@ -193,7 +193,6 @@ const createHarness = () => {
   const section = new FakeSection();
   const view = createSupervisorView({
     section,
-    isSuperAdmin: () => true,
     getToken: () => "",
     apiUrl: (path: string) => `https://supervisor.test${path}`,
   });

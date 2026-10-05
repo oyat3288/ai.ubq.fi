@@ -10,9 +10,8 @@ Deno.test("gateway entry points start no Sentinel automation but keep the author
   // m06 adds only the passive, read-only incident index GET: no automation,
   // dispatch, control or claim/ack/defer wiring may return. The route is now a
   // table entry rather than an inline `method === "GET" && path === ...` chain,
-  // so this pins the entry itself -- including its superAdmin level, which the
-  // previous shape never checked.
-  assert.match(handlerSource, /path: "\/admin\/sentinel\/incidents", superAdmin: true, run: \(req\) => handleAdminSentinelIncidents\(req\)/u);
+  // so this pins the entry itself.
+  assert.match(handlerSource, /path: "\/admin\/sentinel\/incidents", run: \(req\) => handleAdminSentinelIncidents\(req\)/u);
   assert.match(handlerSource, /handleAdminSentinelIncidents/u);
   assert.doesNotMatch(handlerSource, /coalesceSentinelIncidentFailureEvents/u);
   assert.doesNotMatch(handlerSource, /\?\? recordSentinelProviderDegradationFromEnvironment/u);
