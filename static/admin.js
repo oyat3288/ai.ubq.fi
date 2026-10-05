@@ -1195,6 +1195,7 @@ const appendCapacitySourceMeta = (row, source, provider = null) => {
 };
 
 let codexResetSettings = [];
+let codexProviderSettingsLoadedAt = 0;
 let codexResetSettingsRevision = 0;
 const codexResetSaving = new Set();
 let codexResetSettingsTarget = "";
@@ -2921,6 +2922,9 @@ const loadProviderCapacity = async () => {
     setBadge(providerCapacityBadge, "bad", "Sign in required");
     return false;
   }
+  // The capacity list renders on Analytics too: make sure the per-subscription
+  // settings (banked resets, overage) are loaded for that view as well.
+  if (!codexProviderSettingsLoadedAt || codexResetSettingsToken !== token) void loadProviders();
   providerCapacityLoading = true;
   setBadge(providerCapacityBadge, "unknown", providerCapacityLoadedAt ? "Cached · refreshing" : "Loading capacity");
   try {
@@ -3018,7 +3022,9 @@ const loadProviders = async () => {
       return;
     }
     if (settingsRevision === codexResetSettingsRevision && codexResetSaving.size === 0) {
-      codexResetSettings = settingsResponse.ok && Array.isArray(settingsPayload?.data) ? settingsPayload.data : [];
+      // A transient refresh failure must never blank the list: keep the last
+      // good settings until a successful read replaces them.
+      if (settingsResponse.ok && Array.isArray(settingsPayload?.data)) codexResetSettings = settingsPayload.data;
     }
     codexResetSettingsTarget = settingsTarget;
     codexResetSettingsToken = token;
@@ -3031,10 +3037,11 @@ const loadProviders = async () => {
       return;
     }
     if (overageRevision === codexOverageSettingsRevision && codexOverageSaving.size === 0) {
-      codexOverageSettings = overageResponse.ok && Array.isArray(overagePayload?.data) ? overagePayload.data : [];
+      if (overageResponse.ok && Array.isArray(overagePayload?.data)) codexOverageSettings = overagePayload.data;
     }
     codexOverageSettingsTarget = settingsTarget;
     codexOverageSettingsToken = token;
+    codexProviderSettingsLoadedAt = Date.now();
     latestProviderHealth = payload;
     if (latestProviderCapacityChartState?.sources) renderProviderCapacityList(latestProviderCapacityChartState.sources);
     providersLoadedAt = Date.now();
