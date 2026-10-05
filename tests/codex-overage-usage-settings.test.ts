@@ -127,6 +127,48 @@ Deno.test("the admin overage surface rejects malformed bodies and stale subscrip
   assert.equal((await kv.get(codexOverageUsageKey(accountIdHash))).value, null);
 });
 
+Deno.test("the admin overage surface exposes the upstream balance and limit, or usage unavailable", async () => {
+  const originalFetch = globalThis.fetch;
+  kv.clearData();
+  resetCodexAuthCacheForTest();
+  resetOverageUsageCacheForTest();
+  kv.seed(CODEX_AUTH_POOL_KEY, codexPoolEntry(["overage-account-one"]));
+  const stubUsage = (response: () => Response | Promise<Response>) => {
+    globalThis.fetch = (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (!url.endsWith("/backend-api/wham/usage")) throw new Error(`unexpected request ${url}`);
+      return Promise.resolve(response());
+    };
+  };
+  try {
+    // The balance stays the upstream decimal string, and only the two
+    // diagnostics fields are projected.
+    stubUsage(() => Response.json({ credits: { balance: "12.50", overage_limit_reached: false }, plan_type: "prolite" }));
+    const listed = await handleAdminCodexOverageUsage(new Request(OVERAGE_URL));
+    assert.equal(listed.status, 200);
+    const row = ((await readBody(listed)).data as { overage: Record<string, unknown> | null }[])[0];
+    assert.deepEqual(row.overage, { balance: "12.50", overage_limit_reached: false });
+    assert.deepEqual(Object.keys(row.overage ?? {}), ["balance", "overage_limit_reached"]);
+
+    stubUsage(() => Response.json({ credits: { balance: "3.00", overage_limit_reached: true } }));
+    const reached = await handleAdminCodexOverageUsage(new Request(OVERAGE_URL));
+    const reachedRow = ((await readBody(reached)).data as { overage: { overage_limit_reached: boolean | null } | null }[])[0];
+    assert.equal(reachedRow.overage?.overage_limit_reached, true);
+
+    // An upstream failure or an unusable payload reads as null without
+    // failing the settings surface.
+    for (const response of [() => new Response(null, { status: 500 }), () => Response.json({ credits: { balance: 12.5 } })]) {
+      stubUsage(response);
+      const unavailable = await handleAdminCodexOverageUsage(new Request(OVERAGE_URL));
+      assert.equal(unavailable.status, 200);
+      const unavailableRow = ((await readBody(unavailable)).data as { overage: unknown }[])[0];
+      assert.equal(unavailableRow.overage, null);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test("one subscription's overage choice never changes another account's value", async () => {
   kv.clearData();
   resetCodexAuthCacheForTest();

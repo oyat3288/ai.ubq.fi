@@ -500,6 +500,48 @@ export const unavailableCodexUsageResetProvider: CodexUsageResetProvider = Objec
   verifyApplied: (_input: ResetAccountContext, _signal: AbortSignal): Promise<boolean> => unavailable(),
 });
 
+/** One redacted diagnostics credit: status and expiry only, never the raw id. */
+export type CodexResetCreditDiagnostic = Readonly<{ status: string; expires_at_ms: number | null }>;
+
+/**
+ * Read-only diagnostics list; never authorizes a redemption or refreshes
+ * credentials. It shares the bounded display-read pattern with the count so an
+ * admin view can show expiries without touching the spend path.
+ */
+export const readCodexResetCredits = async (
+  options: UpstreamCodexUsageResetProviderOptions,
+  signal: AbortSignal
+): Promise<readonly CodexResetCreditDiagnostic[]> => {
+  const { inventoryUrl } = resolveCodexUsageResetCreditEndpoints(options.codexBaseUrl);
+  const fetcher = options.fetch ?? globalThis.fetch;
+  const response = await fetcher(inventoryUrl, {
+    method: "GET",
+    headers: {
+      Authorization: "Bearer " + options.accessToken,
+      "ChatGPT-Account-ID": options.accountId,
+      "User-Agent": options.userAgent,
+    },
+    redirect: "manual",
+    signal,
+  });
+  if (!isHttpSuccess(response.status)) {
+    discardResponseBody(response);
+    throw new CodexUsageResetProviderHttpError("inventory", response.status);
+  }
+  const payload: unknown = await response.json();
+  if (!isRecord(payload) || !isNonnegativeSafeInteger(payload.available_count)) {
+    throw new CodexUsageResetProviderConfigurationError("Reset-credit inventory response was invalid.");
+  }
+  const credits = parseDetailedCredits(payload.credits, payload.available_count);
+  if (!credits) {
+    throw new CodexUsageResetProviderConfigurationError("Reset-credit inventory did not include a complete detailed available-credit list.");
+  }
+  return credits
+    .filter((credit) => credit.status === "available")
+    .map((credit) => ({ status: credit.status, expires_at_ms: credit.expiresAtMs }))
+    .sort((left, right) => (left.expires_at_ms ?? Number.POSITIVE_INFINITY) - (right.expires_at_ms ?? Number.POSITIVE_INFINITY));
+};
+
 /** Read-only display count; never authorizes a redemption or refreshes credentials. */
 export const readCodexResetAvailableCount = async (options: UpstreamCodexUsageResetProviderOptions, signal: AbortSignal): Promise<number> => {
   const { inventoryUrl } = resolveCodexUsageResetCreditEndpoints(options.codexBaseUrl);

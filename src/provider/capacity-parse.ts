@@ -1,7 +1,7 @@
 // Provider capacity parsing and stored-snapshot decoding, split out of src/provider_capacity.ts.
 
 import { config } from "../config.ts";
-import { isRecord } from "../utils.ts";
+import { getString, isRecord } from "../utils.ts";
 import {
   ADDITIONAL_WINDOW_UNANCHORED_TOLERANCE_MS,
   PROVIDER_CAPACITY_LAST_AVAILABLE_KEY_PREFIX,
@@ -115,6 +115,24 @@ const additionalRateLimitsForRouting = (
       },
     ];
   });
+
+/**
+ * Admin diagnostics only: the upstream overage balance and limit flag exactly
+ * as returned. The balance stays the upstream decimal string; a missing or
+ * malformed pair means the sample is unavailable rather than zero.
+ */
+export type ProviderCapacityOverageUsage = Readonly<{ balance: string | null; overage_limit_reached: boolean | null }>;
+
+const parseCodexOverageUsage = (value: unknown): ProviderCapacityOverageUsage | null => {
+  if (!isRecord(value)) return null;
+  // The live /backend-api/wham/usage payload nests both fields under `credits`.
+  const credits = isRecord(value.credits) ? value.credits : null;
+  if (!credits) return null;
+  const balance = getString(credits.balance);
+  const overageLimitReached = typeof credits.overage_limit_reached === "boolean" ? credits.overage_limit_reached : null;
+  if (balance === null && overageLimitReached === null) return null;
+  return { balance, overage_limit_reached: overageLimitReached };
+};
 
 const parseCodexUsage = (
   value: unknown
@@ -373,6 +391,7 @@ export {
   additionalRateLimitsForRouting,
   codexUsageUrl,
   isSafeTimestamp,
+  parseCodexOverageUsage,
   parseCodexUsage,
   providerCapacityLastAvailableKey,
   readCapacitySnapshot,
