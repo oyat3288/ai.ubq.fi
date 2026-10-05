@@ -24,14 +24,14 @@ requests and the existing paid-fallback history. No new history path was added; 
 Every create, edit, revoke, unrevoke and delete that actually changes key state appends one compact event to
 `["uos_ai","api_keys","change"]` in the same `kv.atomic()` commit as the key-state change, so an injected audit-commit
 failure leaves the key unchanged and returns failure. A no-op PATCH and an unrevoke of an already-active key keep their
-original success response and append no event: the contract is that a real state change cannot succeed without its
-audit event, not that an idempotent call fabricates one. Deletion events are written before the purge loops and live
-under a prefix the purge does not touch, so a deleted key keeps a minimal nonsecret event. An event carries a stable
-id, timestamp, action, target key id, the key name, the safe changed policy fields (allowlisted: name, expiry, request
+original success response and append no event: the contract is that a real state change cannot succeed without its audit
+event, not that an idempotent call fabricates one. Deletion events are written before the purge loops and live under a
+prefix the purge does not touch, so a deleted key keeps a minimal nonsecret event. An event carries a stable id,
+timestamp, action, target key id, the key name, the safe changed policy fields (allowlisted: name, expiry, request
 limit, window, paid-overflow enablement/limit, reset, revocation), the admin request id and the release identity. Actor
 kinds distinguish an identified passkey user (`principal_id` = passkey user id) from the shared admin allowlist/deploy
-credential, a local admin with auth disabled, and unknown; a shared credential never records a human identity. No
-token, token hash, Authorization header, prompt or raw error is persisted or served.
+credential, a local admin with auth disabled, and unknown; a shared credential never records a human identity. No token,
+token hash, Authorization header, prompt or raw error is persisted or served.
 
 `GET /admin/api-keys/changes` is an admin-only read surface (ordinary admin auth, not super-admin) returning
 newest-first events with a bounded `limit` (default 20, maximum 50) and an opaque cursor; events carry KV TTLs of 90
