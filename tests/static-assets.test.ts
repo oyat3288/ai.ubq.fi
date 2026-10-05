@@ -60,6 +60,7 @@ Deno.test("static assets register frontend module dependencies", () => {
     "/auth.js",
     "/auth-relay.js",
     "/chat-stats.js",
+    "/debounce.js",
     "/foreground-refresh.js",
     "/network.js",
     "/models.js",

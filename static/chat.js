@@ -32,6 +32,7 @@ import {
   splitChatSseEvents,
 } from "./chat-stats.js?v=20260827-response-stats-v4";
 import { bindForegroundRefresh } from "./foreground-refresh.js";
+import { debounce } from "./debounce.js";
 import { toast } from "./toast.js?v=passport-design-20260922";
 
 const STORAGE_KEYS = {
@@ -46,17 +47,6 @@ const STORAGE_KEYS = {
 };
 
 const PANEL_STATE_PREFIX = "uos_ai.playground.panel.";
-
-const debounce = (fn, wait = 450) => {
-  let timer = null;
-  return (...args) => {
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = null;
-      fn(...args);
-    }, wait);
-  };
-};
 
 const mustGet = (id) => {
   const el = document.getElementById(id);
@@ -585,6 +575,7 @@ showTokenInput.addEventListener("change", () => {
 tokenInput.addEventListener("input", () => {
   authCheckId += 1;
   modelsRequestId += 1;
+  scheduleAuthCheck.cancel();
   scheduleTokenPersist();
   const token = tokenInput.value.trim();
   if (!token) {
