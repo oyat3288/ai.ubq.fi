@@ -3,6 +3,12 @@
 import { ApiKeyQuotaDispatchError } from "../api-key-policy.ts";
 import { markCodexQuotaBlocked } from "./rate-limit-429.ts";
 import {
+  capacityHeadroomForObservation,
+  capacityObservationIsFresh,
+  loadCodexCapacityRoutingObservations,
+  routingAccountIdentity,
+} from "./capacity-routing.ts";
+import {
   getCodexQuotaBlockFence,
   isCodexActiveAccountSnapshotCurrent,
   isCodexQuotaBlockFenceCurrent,
@@ -363,7 +369,49 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
     } catch {
       return null;
     }
-    const routedPool = await selectCodexRoutingAccountsStrong(currentPoolEntry.pool, currentPoolEntry.pool.accounts, Date.now(), ctx.requestedModel);
+    // A fully used capacity observation is authoritative evidence that the
+    // subscription cannot serve the requested class until its reset deadline:
+    // materialize the durable class block so a local request can drive the
+    // same banked-reset redemption a live 429 would. Without it the pool
+    // dead-ends locally and silently burns the account's overage credits.
+    const materializeCapacityQuotaBlocks = async (): Promise<void> => {
+      const nowMs = Date.now();
+      const observations = await loadCodexCapacityRoutingObservations(currentPoolEntry.pool, true);
+      for (const [slot, auth] of currentPoolEntry.pool.accounts.entries()) {
+        try {
+          const identity = await routingAccountIdentity(auth);
+          const observation = observations.find((candidate) => candidate.account_id_hash === identity.accountIdHash);
+          if (!observation || observation.state !== "available") continue;
+          if (!capacityObservationIsFresh(observation, nowMs)) continue;
+          if (capacityHeadroomForObservation(observation, ctx.requestedModel) !== 0) continue;
+          const resetAtMs = observation.windows.primary?.reset_at_ms ?? null;
+          if (resetAtMs === null || !Number.isSafeInteger(resetAtMs) || resetAtMs <= nowMs) continue;
+          const account: RoutingAccount = {
+            auth,
+            slot,
+            accountIdHash: identity.accountIdHash,
+            credentialVersion: identity.credentialVersion,
+            quotaHeadroom: 0,
+            probeRequired: false,
+            probeGeneration: null,
+            probeToken: null,
+            probeCircuit: null,
+            requestedModel: ctx.requestedModel ?? null,
+          };
+          await markCodexQuotaBlocked(
+            account,
+            new Response(JSON.stringify({ error: { type: "usage_limit_reached" } }), {
+              status: 429,
+              headers: { "Content-Type": "application/json", "Retry-After": new Date(resetAtMs).toUTCString() },
+            }),
+            nowMs
+          );
+        } catch {
+          // One account's failed materialization must not stop the others.
+        }
+      }
+    };
+    let routedPool = await selectCodexRoutingAccountsStrong(currentPoolEntry.pool, currentPoolEntry.pool.accounts, Date.now(), ctx.requestedModel);
     if (routedPool.kind === "routing_unavailable") {
       logCodexRouting("codex_banked_reset_preflight", {
         request_id: ctx.options.requestId ?? null,
@@ -377,17 +425,24 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
     // lease, an invalid credential, or unclassified state is not quota
     // exhaustion and must not spend a credit.
     if (routedPool.kind !== "quota_blocked" || !routedPool.fullCohortExhausted) return null;
-    const blockedAccounts = routedPool.blockedAccounts;
+    let blockedAccounts = routedPool.blockedAccounts;
     if (!blockedAccounts.length) {
-      logCodexRouting("codex_banked_reset_preflight", {
-        request_id: ctx.options.requestId ?? null,
-        require_full_pool: "true",
-        outcome: "skipped",
-        reason: "no_blocked_identity",
-        candidate_count: 0,
-        selected_slot: null,
-      });
-      return null;
+      await materializeCapacityQuotaBlocks();
+      const refreshed = await selectCodexRoutingAccountsStrong(currentPoolEntry.pool, currentPoolEntry.pool.accounts, Date.now(), ctx.requestedModel);
+      if (refreshed.kind === "quota_blocked" && refreshed.fullCohortExhausted && refreshed.blockedAccounts.length) {
+        routedPool = refreshed;
+        blockedAccounts = refreshed.blockedAccounts;
+      } else {
+        logCodexRouting("codex_banked_reset_preflight", {
+          request_id: ctx.options.requestId ?? null,
+          require_full_pool: "true",
+          outcome: "skipped",
+          reason: "no_blocked_identity",
+          candidate_count: 0,
+          selected_slot: null,
+        });
+        return null;
+      }
     }
     if (routedPool.poolSnapshotJson === null || routedPool.capacitySnapshotJson === null) return null;
     const cohort: CodexResetCohortSnapshot = { poolJson: routedPool.poolSnapshotJson, capacityJson: routedPool.capacitySnapshotJson };
