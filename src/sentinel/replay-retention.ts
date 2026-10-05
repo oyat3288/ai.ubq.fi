@@ -431,26 +431,26 @@ export const abandonSentinelReplayAccounting = async (
   return { revoked: true, deleted_chunks: cleanup.deleted, released, remaining: 0 };
 };
 
-/**
- * Find fenced/abandoned rows to clean up with bounded work. A revoked row keeps
- * its original capture timestamp, so it can sit anywhere in the oldest-first
- * prefix: scanning only the oldest window would never reach a fresh revoke on a
- * busy host, and scanning only the newest would strand an old one. Both ends of
- * the prefix are swept in bounded windows, without adding a second index.
- */
+/** Find fenced/abandoned rows with bounded work and a durable prefix cursor. */
+// Keep the cursor outside the accounting prefix so discovery never counts it as a row.
+const SENTINEL_REPLAY_REAP_CURSOR_KEY = ["uos_ai", "sentinel_replay", "v1", "reap_cursor"] as const;
 const reapCandidates = async (kv: Deno.Kv, nowMs: number, limit: number): Promise<Readonly<{ key: Deno.KvKey; row: SentinelReplayAccountingRow }>[]> => {
-  const found = new Map<string, Readonly<{ key: Deno.KvKey; row: SentinelReplayAccountingRow }>>();
+  const cursorEntry = await kv.get<string>(SENTINEL_REPLAY_REAP_CURSOR_KEY);
+  const cursor = typeof cursorEntry.value === "string" && cursorEntry.value.length > 0 ? cursorEntry.value : undefined;
+  const iterator = kv.list<SentinelReplayAccountingRow>({ prefix: SENTINEL_REPLAY_ACCOUNTING_PREFIX }, { cursor, limit: limit * 4 });
+  const found: { key: Deno.KvKey; row: SentinelReplayAccountingRow }[] = [];
   const isCandidate = (row: SentinelReplayAccountingRow): boolean => row.state === "revoked" || (row.state === "reserved" && row.expires_at_ms <= nowMs);
-  for (const reverse of [false, true]) {
-    for await (const entry of kv.list<SentinelReplayAccountingRow>({ prefix: SENTINEL_REPLAY_ACCOUNTING_PREFIX }, { limit: limit * 4, reverse })) {
-      if (!isAccountingRow(entry.value) || !accountingKeyMatches(entry.key, entry.value)) continue;
-      if (!isCandidate(entry.value)) continue;
-      found.set(entry.key.join("\u0000"), { key: entry.key, row: entry.value });
-      if (found.size >= limit) break;
+  for await (const entry of iterator) {
+    if (isAccountingRow(entry.value) && accountingKeyMatches(entry.key, entry.value) && isCandidate(entry.value)) {
+      found.push({ key: entry.key, row: entry.value });
     }
-    if (found.size >= limit) break;
+    if (found.length >= limit) break;
   }
-  return [...found.values()].slice(0, limit);
+  const nextCursor = iterator.cursor || null;
+  const operation = kv.atomic().check({ key: SENTINEL_REPLAY_REAP_CURSOR_KEY, versionstamp: cursorEntry.versionstamp });
+  const committed = nextCursor === null ? operation.delete(SENTINEL_REPLAY_REAP_CURSOR_KEY) : operation.set(SENTINEL_REPLAY_REAP_CURSOR_KEY, nextCursor);
+  await committed.commit();
+  return found;
 };
 
 const reapAccountingRows = async (kv: Deno.Kv, nowMs: number, budgetBytes: number): Promise<number> => {

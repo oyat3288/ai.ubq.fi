@@ -702,6 +702,61 @@ Deno.test({
 });
 
 Deno.test({
+  name: "a resumable reaper reaches an expired reservation stranded in the accounting prefix",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    setKvForTest(kv);
+    const now = 1_700_350_000_000;
+    const budgetBytes = 8 * 1_024 * 1_024;
+    const middle = 32;
+    const keys: Deno.KvKey[] = [];
+    let totalCharge = 0;
+    try {
+      for (let index = 0; index < middle * 2 + 1; index += 1) {
+        const admission = await admitForTest(kv, `reap-stranded-${index}`, now + index, budgetBytes);
+        assert.equal(admission.ok, true);
+        if (!admission.ok) throw new Error("unreachable");
+        keys.push(admission.accounting_key);
+        totalCharge += admission.charge;
+      }
+      await kv.delete(["uos_ai", "sentinel_replay", "v1", "reap_cursor"]);
+      const stranded = await accountingRowOf(kv, keys[middle]);
+      assert.notEqual(stranded, null);
+      if (!stranded) throw new Error("unreachable");
+      const maintenanceNow = stranded.expires_at_ms + 1;
+      for (let index = 0; index < keys.length; index += 1) {
+        if (index === middle) continue;
+        const row = await accountingRowOf(kv, keys[index]);
+        assert.notEqual(row, null);
+        if (!row) throw new Error("unreachable");
+        await kv.set(keys[index], { ...row, state: "stored", expires_at_ms: maintenanceNow + 1 });
+      }
+      const ledger = await ledgerOf(kv, budgetBytes);
+      await kv.set(SENTINEL_REPLAY_BUDGET_LEDGER_KEY, {
+        ...ledger,
+        stored_bytes: totalCharge - stranded.bytes,
+        reserved_bytes: stranded.bytes,
+        records: keys.length - 1,
+      });
+
+      await runSentinelReplayRetentionMaintenance(kv, { now_ms: maintenanceNow, budget_bytes: budgetBytes });
+      assert.notEqual(await accountingRowOf(kv, keys[middle]), null, "the first bounded page stops before the stranded row");
+      await runSentinelReplayRetentionMaintenance(kv, { now_ms: maintenanceNow, budget_bytes: budgetBytes });
+      assert.equal(await accountingRowOf(kv, keys[middle]), null, "the cursor reaches the middle on the next pass");
+      const after = await ledgerOf(kv, budgetBytes);
+      assert.equal(after.stored_bytes, totalCharge - stranded.bytes);
+      assert.equal(after.reserved_bytes, 0);
+    } finally {
+      kv.close();
+      setKvForTest(null);
+    }
+  },
+});
+
+Deno.test({
   name: "an expired payload is reclaimed exactly once as expired, never as evicted",
   ignore: !kvAvailable,
   sanitizeResources: false,
