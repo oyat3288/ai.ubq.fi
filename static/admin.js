@@ -6188,7 +6188,7 @@ const renderKeys = (keys, view = "all") => {
       nameInput.value = key.name || "";
       const limit = typeof key.usage_limit_requests === "number" ? key.usage_limit_requests : -1;
       limitUnlimited.input.checked = limit === -1;
-      lastFiniteLimit = limit >= 0 ? limit : DEFAULT_FINITE_USAGE_LIMIT;
+      if (limit >= 0) lastFiniteLimit = limit;
       limitInput.value = String(lastFiniteLimit);
       limitInput.disabled = limitUnlimited.input.checked;
       windowInput.value = String(resolveKeyWindowMs());
@@ -6198,7 +6198,7 @@ const renderKeys = (keys, view = "all") => {
       paidFallbackInput.checked = key.paid_fallback_enabled === true;
       const paidLimit = normalizeFiniteNumber(key.paid_fallback_limit_credits) ?? 0;
       paidLimitUnlimited.input.checked = paidLimit === -1;
-      lastFinitePaidFallbackLimit = paidLimit > 0 ? paidLimit : DEFAULT_FINITE_PAID_FALLBACK_LIMIT;
+      if (paidLimit > 0) lastFinitePaidFallbackLimit = paidLimit;
       paidFallbackLimitInput.value = String(lastFinitePaidFallbackLimit);
       syncPaidFallbackEditorVisibility();
     };
