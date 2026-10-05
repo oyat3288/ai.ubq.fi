@@ -25,7 +25,7 @@ import { OPENROUTER_SYSTEMONE_URL, readOpenRouterApiKey } from "../provider/open
 import { SYSTEMONE_DEFAULT_MODEL } from "../systemone/handlers.ts";
 import { JevClient } from "../../lib/jev_compaction/client.ts";
 import { compact } from "../../lib/jev_compaction/compact.ts";
-import { isResponsesCompaction, MAX_SUMMARY_CHARS, parseCodexInput, parseTurnMetadata, renderSummary } from "../../lib/jev_compaction/codex_items.ts";
+import { isResponsesCompaction, parseCodexInput, parseTurnMetadata, renderSummary } from "../../lib/jev_compaction/codex_items.ts";
 import { collectToolCalls } from "../../lib/jev_compaction/state.ts";
 import type { CallDecision, CompactResult, JevAsker, ToolCall } from "../../lib/jev_compaction/types.ts";
 
@@ -42,6 +42,16 @@ export const COMPACTION_OPTIONS = {
 
 /** Bound on one Jev HTTP call, headers and response body included. */
 export const JEV_TIMEOUT_MS = 30_000;
+
+/**
+ * Hard bound on the rendered memory. The ported 400,000-character default can
+ * be exceeded by text and pinned segments, which are never dropped or
+ * truncated, so the gateway raises the bound for its own sessions. Fitting
+ * first drops lowest-relevance unpinned results; above this ceiling the request
+ * still fails closed. 1.5M chars is roughly 375k tokens, well inside the
+ * 1,048,576-token session window.
+ */
+export const SUMMARY_CHAR_CAP = 1_500_000;
 
 type FailureKind =
   | "unparsable-body"
@@ -78,6 +88,14 @@ function record(value: unknown): Record<string, unknown> | null {
 
 /** Header-only predicate; absent, malformed or unknown markers stay on the normal route. */
 export function isJevCompactionRequest(req: Request): boolean {
+  // Operator escape hatch: bypass interception entirely and let the marked
+  // request take the ordinary provider route. Unset by default; a denied
+  // environment read keeps the interception enabled.
+  try {
+    if (Deno.env.get("JEV_COMPACTION_DISABLED") === "1") return false;
+  } catch {
+    // keep interception enabled
+  }
   return isResponsesCompaction(parseTurnMetadata(req.headers.get(TURN_METADATA_HEADER)));
 }
 
@@ -153,7 +171,12 @@ function failureLogDetail(kind: FailureKind, message: string): string {
   const counts = /dropped=(\d+), before=(\d+), after=(\d+)/.exec(message);
   if (counts) return `dropped=${counts[1]} before=${counts[2]} after=${counts[3]}`;
   const chars = /summary is (\d+) chars/.exec(message);
-  if (chars) return `summary-chars=${chars[1]}`;
+  if (chars) {
+    const composition = /unpinned_kept=(\d+) pinned=(\d+) results_dropped=(\d+)/.exec(message);
+    return composition
+      ? `summary-chars=${chars[1]} unpinned_kept=${composition[1]} pinned=${composition[2]} dropped=${composition[3]}`
+      : `summary-chars=${chars[1]}`;
+  }
   return kind;
 }
 
@@ -207,7 +230,7 @@ function renderCompactedSummary(
 }
 
 /**
- * Fits the rendered summary under `MAX_SUMMARY_CHARS` by dropping additional
+ * Fits the rendered summary under `SUMMARY_CHAR_CAP` by dropping additional
  * unpinned kept results, lowest Jev `keepResult` first, and taking the minimal
  * fitting prefix across re-renders. Pinned data is never dropped or truncated;
  * dropping every unpinned kept result is the floor, and beyond it the request
@@ -219,7 +242,7 @@ function fitCompactedSummary(
   result: CompactResult
 ): { summary: string; fittedDrops: number; stats: CompactResult["stats"] } {
   const summary = renderCompactedSummary(transcript, calls, result);
-  if (summary.length <= MAX_SUMMARY_CHARS) return { summary, fittedDrops: 0, stats: result.stats };
+  if (summary.length <= SUMMARY_CHAR_CAP) return { summary, fittedDrops: 0, stats: result.stats };
 
   const fitIds = result.decisions
     .filter((decision) => decision.action === "keep" && decision.reason === "kept")
@@ -235,26 +258,29 @@ function fitCompactedSummary(
 
   if (fitIds.length === 0) {
     // Only pinned or already-dropped data exceeds the cap; nothing may shrink.
-    throw new CompactionUnavailable("summary-too-large", `summary is ${summary.length} chars (limit ${MAX_SUMMARY_CHARS})`);
-  }
-  const floor = renderWithDropped(fitIds.length);
-  if (floor.length > MAX_SUMMARY_CHARS) {
     throw new CompactionUnavailable(
       "summary-too-large",
-      `summary is ${floor.length} chars (limit ${MAX_SUMMARY_CHARS}) with all ${fitIds.length} unpinned kept results dropped`
+      `summary is ${summary.length} chars (limit ${SUMMARY_CHAR_CAP}); unpinned_kept=0 pinned=${result.stats.pinned} results_dropped=${result.stats.resultsDropped}`
+    );
+  }
+  const floor = renderWithDropped(fitIds.length);
+  if (floor.length > SUMMARY_CHAR_CAP) {
+    throw new CompactionUnavailable(
+      "summary-too-large",
+      `summary is ${floor.length} chars (limit ${SUMMARY_CHAR_CAP}) with all ${fitIds.length} unpinned kept results dropped; unpinned_kept=${fitIds.length} pinned=${result.stats.pinned} results_dropped=${result.stats.resultsDropped + fitIds.length}`
     );
   }
   let low = 0;
   let high = fitIds.length;
   while (high - low > 1) {
     const mid = Math.floor((low + high) / 2);
-    if (renderWithDropped(mid).length <= MAX_SUMMARY_CHARS) high = mid;
+    if (renderWithDropped(mid).length <= SUMMARY_CHAR_CAP) high = mid;
     else low = mid;
   }
   const fitted = renderWithDropped(high);
-  if (fitted.length > MAX_SUMMARY_CHARS) {
+  if (fitted.length > SUMMARY_CHAR_CAP) {
     // Fail closed: a non-monotone render must never ship an oversized summary.
-    throw new CompactionUnavailable("summary-too-large", `summary is ${fitted.length} chars (limit ${MAX_SUMMARY_CHARS})`);
+    throw new CompactionUnavailable("summary-too-large", `summary is ${fitted.length} chars (limit ${SUMMARY_CHAR_CAP})`);
   }
   const dropped = new Set(fitIds.slice(0, high));
   const droppedChars = calls.filter((call) => dropped.has(call.id)).reduce((sum, call) => sum + call.resultChars, 0);
