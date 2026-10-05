@@ -1457,3 +1457,10 @@ and pruning occurs only after exact loopback and public identity acceptance. Uns
 launchers are refused before destructive activation; successful historical restoration and first-deployment rollback
 remain separate unresolved scopes. The normal deployment command must permit the verified prior loopback port, and
 verify/CI must provide the scoped shell and loopback capabilities required by every actual launcher fixture.
+
+## Jev compaction upstream - 2026-10-05
+
+Compaction asks Jev through the gateway's normal Jev route: the OpenRouter System One endpoint with the shared
+`OPENROUTER_API_KEY` and default model that `/v1/systemone` serves with. The standalone `TYPESAFE_API_KEY` path is
+removed; a missing OpenRouter credential is the only missing-key failure. Selection, batching, the 30-second Jev bound,
+and fail-closed behavior are unchanged.

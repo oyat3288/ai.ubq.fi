@@ -5,7 +5,7 @@
  * gateway handler over loopback HTTP (real KV, seeded key, quota admission).
  * The gateway's ordinary route forwards to a scripted loopback Chat Completions
  * upstream, so every main-model response is mocked and no paid inference runs.
- * Jev is the only external hop: when the existing `TYPESAFE_API_KEY` is present
+ * Jev is the only external hop: when the existing `OPENROUTER_API_KEY` is present
  * the gateway's own Jev client is used (live mode); otherwise a deterministic
  * fake asker is injected (fake mode). No flag or new env name selects the mode.
  *
@@ -25,7 +25,7 @@
  * present, and the only paid calls are the authorized synthetic compactions):
  *   deno run --unstable-kv --allow-run=codex --allow-read --allow-write \
  *     --allow-net=127.0.0.1,api.typesafe.ai \
- *     --allow-env=PATH,TMPDIR,DEEPSEEK_API_KEY,TYPESAFE_API_KEY lib/jev_compaction/jev-codex-smoke.ts
+ *     --allow-env=PATH,TMPDIR,DEEPSEEK_API_KEY,OPENROUTER_API_KEY lib/jev_compaction/jev-codex-smoke.ts
  *
  * It exercises: ordinary turns with no Jev, one manual compaction whose summary
  * the next request adopts, one isolated small auto-compaction threshold, and (in
@@ -121,9 +121,9 @@ function adoptedSummary(body: string): string {
 }
 
 /** Jev availability, read as a presence boolean only; never logged or echoed. */
-function typesafeKeyPresent(): boolean {
+function openRouterKeyPresent(): boolean {
   try {
-    const key = Deno.env.get("TYPESAFE_API_KEY");
+    const key = Deno.env.get("OPENROUTER_API_KEY");
     return key !== undefined && key.length > 0;
   } catch {
     return false;
@@ -835,7 +835,7 @@ type Report = {
 const report: Report = {
   status: "FAIL",
   failure_class: "not-started",
-  mode: typesafeKeyPresent() ? "live" : "fake",
+  mode: openRouterKeyPresent() ? "live" : "fake",
   manual_compaction_ok: false,
   adopted_summary_chars: 0,
   summary_has_stats_trailer: false,

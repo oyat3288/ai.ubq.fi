@@ -13,10 +13,16 @@
  * handled here. Every failure returns a non-success response before any
  * successful completion is emitted, so Codex keeps its existing history; kept
  * content is never truncated to force a success and no usage is invented.
+ *
+ * Upstream: Jev calls ride the gateway's normal Jev route - the OpenRouter
+ * System One transport (`OPENROUTER_SYSTEMONE_URL`) with the shared provider
+ * credential - so compaction needs no standalone TypeSafe key.
  */
 import { openaiError } from "../http.ts";
 import { setResponseCompletionTelemetry } from "../openai-telemetry.ts";
 import { readJsonBody } from "../request.ts";
+import { OPENROUTER_SYSTEMONE_URL, readOpenRouterApiKey } from "../provider/openrouter.ts";
+import { SYSTEMONE_DEFAULT_MODEL } from "../systemone/handlers.ts";
 import { JevClient } from "../../lib/jev_compaction/client.ts";
 import { compact } from "../../lib/jev_compaction/compact.ts";
 import { isResponsesCompaction, MAX_SUMMARY_CHARS, parseCodexInput, parseTurnMetadata, renderSummary } from "../../lib/jev_compaction/codex_items.ts";
@@ -140,7 +146,7 @@ function failureLogDetail(kind: FailureKind, message: string): string {
   if (message.startsWith("Invalid Jev answer")) return "invalid-answer";
   if (message.includes("no room for questions")) return "state-over-budget";
   if (message.includes("history too large for Jev")) return "state-too-large";
-  if (message.includes("TYPESAFE_API_KEY")) return "missing-key";
+  if (message.includes("OPENROUTER_API_KEY")) return "missing-key";
   const counts = /dropped=(\d+), before=(\d+), after=(\d+)/.exec(message);
   if (counts) return `dropped=${counts[1]} before=${counts[2]} after=${counts[3]}`;
   const chars = /summary is (\d+) chars/.exec(message);
@@ -363,20 +369,6 @@ export function createJevTimeoutFetch(baseFetch: typeof fetch, timeoutMs = JEV_T
   };
 }
 
-/**
- * Safe lazy credential access: read only when a recognized compaction request
- * needs it, and treat a denied or absent value as an explicit failure instead of
- * a process-startup failure. Never logged or echoed.
- */
-function typesafeApiKey(): string | null {
-  try {
-    const key = Deno.env.get("TYPESAFE_API_KEY");
-    return key !== undefined && key.length > 0 ? key : null;
-  } catch {
-    return null;
-  }
-}
-
 export type JevCompactionDeps = {
   /** Caller-owned signal; a client cancellation stops the Jev calls and the operation. */
   signal?: AbortSignal;
@@ -384,7 +376,7 @@ export type JevCompactionDeps = {
   asker?: JevAsker;
   /** Test seam: replaces the Jev transport fetch. */
   fetch?: typeof fetch;
-  /** Resolved credential for this call; `null` forces the explicit missing-key failure. */
+  /** Resolved provider credential seam; `null` forces the explicit missing-key failure. */
   apiKey?: string | null;
 };
 
@@ -395,11 +387,20 @@ export const setJevCompactionAskerForTest = (asker: JevAsker | null): void => {
   askerForTest = asker;
 };
 
+/**
+ * Jev asks ride the gateway's normal Jev route: the OpenRouter System One
+ * transport that serves `/v1/systemone`, with the same shared provider
+ * credential and default model. Credential access stays lazy - read only when a
+ * recognized compaction request needs it - and a missing value is an explicit
+ * compaction failure, never a process-startup failure. Never logged or echoed.
+ */
 function defaultAsker(deps: JevCompactionDeps): JevAsker {
-  const apiKey = deps.apiKey === undefined ? typesafeApiKey() : deps.apiKey;
-  if (!apiKey) throw new CompactionUnavailable("missing-key", "TYPESAFE_API_KEY is not configured");
+  const apiKey = deps.apiKey === undefined ? readOpenRouterApiKey() : deps.apiKey;
+  if (!apiKey) throw new CompactionUnavailable("missing-key", "OPENROUTER_API_KEY is not configured");
   return new JevClient({
     apiKey,
+    baseUrl: OPENROUTER_SYSTEMONE_URL,
+    model: SYSTEMONE_DEFAULT_MODEL,
     fetch: createJevTimeoutFetch(deps.fetch ?? fetch, JEV_TIMEOUT_MS),
     ...(deps.signal ? { signal: deps.signal } : {}),
   });
