@@ -199,7 +199,12 @@ const evaluateCodexRoutingAccount = (
     return skippedRoutingAccount(routedAccount, mapped.slot + 1, "quota", quotaSkip.retryAtMs, quotaSkip.blockedAccount, "quota_exhausted");
   }
   if (capacity.capacityExhausted) {
-    return { ...skippedRoutingAccount(routedAccount, mapped.slot + 1, "quota", null, null, "quota_exhausted"), capacityExhausted: true };
+    // A capacity-observed exhaustion carries no provider-proven reset identity.
+    // Keep the subscription half-open so a bounded probe can either serve the
+    // request or observe the authoritative 429 that re-arms the banked-reset
+    // fences. Refusing locally here strands every reset fence until the window
+    // resets, because no later request can ever re-observe the account.
+    return { ...routedRoutingAccount({ ...routedAccount, probeRequired: true, probeCircuit: "quota" }), capacityExhausted: true };
   }
   const leaseSkip = probeLeaseSkipFor(slot, requestedQuotaClass, now);
   if (leaseSkip !== null) return skippedRoutingAccount(routedAccount, mapped.slot + 1, leaseSkip.circuit, leaseSkip.retryAtMs, null);

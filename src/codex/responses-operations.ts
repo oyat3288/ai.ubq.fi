@@ -378,7 +378,17 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
     // exhaustion and must not spend a credit.
     if (routedPool.kind !== "quota_blocked" || !routedPool.fullCohortExhausted) return null;
     const blockedAccounts = routedPool.blockedAccounts;
-    if (!blockedAccounts.length) return null;
+    if (!blockedAccounts.length) {
+      logCodexRouting("codex_banked_reset_preflight", {
+        request_id: ctx.options.requestId ?? null,
+        require_full_pool: "true",
+        outcome: "skipped",
+        reason: "no_blocked_identity",
+        candidate_count: 0,
+        selected_slot: null,
+      });
+      return null;
+    }
     if (routedPool.poolSnapshotJson === null || routedPool.capacitySnapshotJson === null) return null;
     const cohort: CodexResetCohortSnapshot = { poolJson: routedPool.poolSnapshotJson, capacityJson: routedPool.capacitySnapshotJson };
     const originalActive = routedPool.activeSnapshot;
