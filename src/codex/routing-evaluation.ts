@@ -30,6 +30,7 @@ import {
   withLegacyQuotaClassMap,
 } from "./capacity-routing.ts";
 import { codexModelUnavailableAccounts } from "../models/codex-models-availability.ts";
+import { overageUsageAllowedSync } from "./overage-settings.ts";
 
 /** A slot identity resolved from the pool before its durable routing state is read. */
 type CodexRoutingSlotIdentity = Readonly<{
@@ -200,6 +201,12 @@ const evaluateCodexRoutingAccount = (
     return skippedRoutingAccount(routedAccount, mapped.slot + 1, "quota", quotaSkip.retryAtMs, quotaSkip.blockedAccount, "quota_exhausted");
   }
   if (capacity.capacityExhausted) {
+    // The operator explicitly allows overage spending for this subscription:
+    // keep it half-open so the request may serve through the paid backup
+    // balance instead of waiting for a banked-reset redemption.
+    if (overageUsageAllowedSync(account.accountIdHash)) {
+      return { ...routedRoutingAccount({ ...routedAccount, probeRequired: true, probeCircuit: "quota" }), capacityExhausted: true };
+    }
     // A fully used capacity observation with a future reset deadline is the
     // authoritative quota block for that window: it must feed the blocked
     // cohort so the automatic banked-reset flow can redeem (the deploy

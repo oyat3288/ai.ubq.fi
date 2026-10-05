@@ -446,10 +446,14 @@ const buildExpiredProbeClaim = (
   // candidate that has no deadline to expire: its only trusted recovery is a
   // successful bounded probe, so it is claimed like an expired circuit.
   const capacityProbe = circuit === "quota" && classBlock === null && account.quotaHeadroom === 0;
+  // A blocked cohort that proved no redeemable credit may hold exactly one
+  // scoped overage attempt even while its class-block deadline is still live.
+  // The live-lease check below still serializes the attempt.
+  const overageProbe = circuit === "quota" && account.overageFallback === true;
   if (
     !slotMatchesRoutingAccount(current, account) ||
     current.invalid_credential_version === account.credentialVersion ||
-    (!capacityProbe && (!circuitDeadline || circuitDeadline > now)) ||
+    (!capacityProbe && !overageProbe && (!circuitDeadline || circuitDeadline > now)) ||
     (current.probe_lease?.expires_at_ms ?? 0) > now
   )
     return null;

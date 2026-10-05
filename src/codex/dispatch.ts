@@ -435,7 +435,7 @@ const prepareCodexSubscriptionRequest = async (body: unknown, cacheScope: string
   };
 };
 
-type CodexAttemptPhase = "initial" | "post_refresh" | "two_second_retry" | "post_retry_refresh" | "post_banked_reset";
+type CodexAttemptPhase = "initial" | "post_refresh" | "two_second_retry" | "post_retry_refresh" | "post_banked_reset" | "overage_fallback";
 
 type CodexBankedResetOptions = Readonly<{
   /** Test seam; normal traffic creates an account-bound upstream adapter only for a live reset candidate. */
@@ -502,7 +502,8 @@ const dispatchFailureAsError = (error: unknown, fallback: () => Error): Error =>
 };
 
 const logCodexRouting = (
-  event: "codex_attempt" | "codex_banked_reset_preflight" | "codex_quota_classification" | "codex_token_refresh" | "codex_two_second_retry",
+  event:
+    "codex_attempt" | "codex_banked_reset_preflight" | "codex_quota_classification" | "codex_token_refresh" | "codex_two_second_retry" | "codex_overage_served",
   fields: Readonly<Record<string, string | number | null>>
 ): void => {
   try {

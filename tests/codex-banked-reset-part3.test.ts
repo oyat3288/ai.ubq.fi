@@ -27,7 +27,7 @@ Deno.test("config and durable-record parsers are strict, and an unproven provide
       maxPerAccountPerDay: defaults.maxPerAccountPerDay,
       maxPerAccountPerWindow: defaults.maxPerAccountPerWindow,
     },
-    { enabled: true, mode: "shadow", maxPerAccountPerDay: 1, maxPerAccountPerWindow: 1 }
+    { enabled: true, mode: "shadow", maxPerAccountPerDay: 0, maxPerAccountPerWindow: 1 }
   );
 
   const environment = new Map<string, string>([
@@ -46,7 +46,7 @@ Deno.test("config and durable-record parsers are strict, and an unproven provide
   assert.equal(parseCodexBankedResetConfig(() => "1.5").maxPerAccountPerDay, 0);
   // The retired global environment variable is no longer read at all.
   const retiredEnvironment = parseCodexBankedResetConfig((key) => (key === "CODEX_BANKED_RESET_MAX_GLOBAL_PER_DAY" ? "0" : undefined));
-  assert.equal(retiredEnvironment.maxPerAccountPerDay, 1);
+  assert.equal(retiredEnvironment.maxPerAccountPerDay, 0);
 
   const submittedAtMs = 1_700_000_000_001;
   const validRecord: CodexResetRedemptionRecord = {

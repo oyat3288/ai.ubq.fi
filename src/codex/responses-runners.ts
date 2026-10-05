@@ -175,13 +175,18 @@ export const installCodexResponseRunners = (ctx: CodexResponseContext): void => 
     // a reset that was inferred only from a sibling's 429.
     if (ctx.probeUnavailable) return normalResponse;
     const evaluated = await ctx.evaluateBlockedCohortBankedReset();
-    if (!evaluated) return normalResponse;
+    if (!evaluated) {
+      // No banked reset could be redeemed for this episode: one bounded
+      // overage probe may still serve the request for a blocked account.
+      return (await ctx.runOverageFallbackAttempt()) ?? normalResponse;
+    }
     return (await ctx.runPostResetRetry(evaluated, normalResponse)) ?? normalResponse;
   });
 
   const recoverBlockedReset = (ctx.recoverBlockedReset = async (): Promise<Response | null> => {
     const evaluated = await ctx.evaluateBlockedCohortBankedReset();
-    return evaluated ? await ctx.runPostResetRetry(evaluated, null) : null;
+    if (evaluated) return await ctx.runPostResetRetry(evaluated, null);
+    return await ctx.runOverageFallbackAttempt();
   });
 
   const exhaustedQuotaBlockedCohort = (ctx.exhaustedQuotaBlockedCohort = async (retryAtMs: number | null): Promise<Response> => {

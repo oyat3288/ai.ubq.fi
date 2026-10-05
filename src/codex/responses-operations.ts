@@ -6,17 +6,21 @@ import {
   capacityHeadroomForObservation,
   capacityObservationIsFresh,
   loadCodexCapacityRoutingObservations,
+  probeLeaseMatchesRoutingAccount,
   quotaBlockForClass,
   quotaClass,
   routingAccountIdentity,
+  slotMatchesRoutingAccount,
   withLegacyQuotaClassMap,
 } from "./capacity-routing.ts";
 import {
+  claimCodexRoutingProbe,
   getCodexQuotaBlockFence,
   isCodexActiveAccountSnapshotCurrent,
   isCodexQuotaBlockFenceCurrent,
   reconcileCodexRoutingAccount,
   refreshCodexActiveAccountAdmission,
+  releaseCodexRoutingProbe,
   selectCodexRoutingAccountsStrong,
 } from "./account-routing.ts";
 import {
@@ -29,6 +33,7 @@ import {
   CodexError,
   codexAuthWarningForError,
   codexRoutingErrors,
+  codexProbeByResponse,
   codexUserAgent,
   getAuthPoolEntry,
   parseCodexAuthPool,
@@ -68,7 +73,9 @@ import {
   parseCodexAccountRoutingState,
   CODEX_ACTIVE_ACCOUNT_SELECTION_KV_KEY,
   CODEX_CAPACITY_ROUTING_OBSERVATION_KV_KEY,
+  CodexAccountRoutingState,
   CodexActiveAccountSnapshot,
+  CodexBlockedRoutingAccount,
   RoutingAccount,
   isCodexActiveAccountSelectionCurrent,
 } from "./routing-state.ts";
@@ -78,7 +85,70 @@ import { recordProviderCapacityResetEvent, triggerProviderCapacitySample } from 
 import { SentinelUpstreamRecorder } from "../sentinel/upstream-capture.ts";
 import { CodexAuthState } from "../types.ts";
 import { sha256Hex } from "../utils.ts";
-import type { CodexResetCohortSnapshot, CodexResponseContext, EvaluatedBlockedReset, PreexistingBankedReset } from "./responses-state.ts";
+import type {
+  CodexResetCohortSnapshot,
+  CodexResponseContext,
+  EvaluatedBlockedReset,
+  PendingOverageFallback,
+  PreexistingBankedReset,
+} from "./responses-state.ts";
+
+/** Outcomes whose reason proves no banked reset could be redeemed this episode. */
+const OVERAGE_FALLBACK_REASONS: ReadonlySet<string> = new Set([
+  "no_eligible_credit",
+  "inventory_empty",
+  "inventory_no_eligible_codex_credit",
+  "inventory_response_invalid_or_expired",
+  "inventory_unavailable",
+  "account_day_limit_reached",
+]);
+
+/**
+ * Plan at most one bounded overage attempt for the current blocked cohort.
+ * The best candidate is the credit the evaluator selected (the day-cap
+ * refusal), then the current active blocked account, then the first blocked
+ * account. Arming (`live_armed`), a completed spend, and fence/config
+ * failures are not in the reason set and never fall back.
+ */
+const planOverageFallback = (
+  evaluated: Awaited<ReturnType<typeof evaluateCodexBankedResetPool>>,
+  blockedAccounts: readonly CodexBlockedRoutingAccount[],
+  activeSnapshot: CodexActiveAccountSnapshot,
+  currentPoolEntry: Awaited<ReturnType<typeof getAuthPoolEntry>>,
+  requestedModel: string | null
+): PendingOverageFallback | null => {
+  if (!OVERAGE_FALLBACK_REASONS.has(evaluated.reason)) return null;
+  const active = activeSnapshot.selection;
+  const selectedSlot = evaluated.selected?.slot;
+  const blocked =
+    (selectedSlot === undefined ? undefined : blockedAccounts.find((account) => account.slot === selectedSlot)) ??
+    (active === null ? undefined : blockedAccounts.find((account) => account.accountIdHash === active.account_id_hash && account.slot === active.slot)) ??
+    blockedAccounts.at(0);
+  if (!blocked) return null;
+  const routing: RoutingAccount = { ...blocked, probeRequired: true, probeCircuit: "quota", overageFallback: true, requestedModel };
+  return { reason: evaluated.reason, accountEntry: { ...currentPoolEntry, auth: blocked.auth, routing }, routing };
+};
+
+/**
+ * The scoped fence for a fallback attempt: the claimed probe lease must still
+ * name this account, slot generation, circuit and quota class before any
+ * transport. Global routing fences are untouched by the fallback itself.
+ */
+const ensureOverageProbeLeaseCurrent = async (routing: RoutingAccount): Promise<void> => {
+  try {
+    const kv = await getKv();
+    if (!kv) throw new CodexActiveAccountFenceError();
+    const entry = await kv.get<CodexAccountRoutingState>(CODEX_ACCOUNT_ROUTING_KV_KEY, { consistency: "strong" });
+    const state = parseCodexAccountRoutingState(entry.value);
+    const slot = state?.slots.at(routing.slot);
+    if (!slot || !slotMatchesRoutingAccount(slot, routing) || !probeLeaseMatchesRoutingAccount(slot, routing)) {
+      throw new CodexActiveAccountFenceError();
+    }
+  } catch (error) {
+    if (error instanceof CodexActiveAccountFenceError) throw error;
+    throw new CodexActiveAccountFenceError();
+  }
+};
 
 export const installCodexResponseOperations = (ctx: CodexResponseContext): void => {
   const reloadConfiguredBankedResetConfig = (ctx.reloadConfiguredBankedResetConfig = (): CodexBankedResetConfig =>
@@ -366,6 +436,9 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
   });
 
   const evaluateBlockedCohortBankedReset = (ctx.evaluateBlockedCohortBankedReset = async (): Promise<EvaluatedBlockedReset | null> => {
+    // Each evaluation replaces the previous plan; a request can attempt at most
+    // one overage fallback.
+    ctx.overageFallbackPending = null;
     if (ctx.probeUnavailable) return null;
     let currentPoolEntry: Awaited<ReturnType<typeof getAuthPoolEntry>>;
     try {
@@ -498,7 +571,59 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
       candidate_count: poolCandidates.length,
       selected_slot: evaluated.selected === null ? null : evaluated.selected.slot + 1,
     });
+    ctx.overageFallbackPending = planOverageFallback(evaluated, blockedAccounts, routedPool.activeSnapshot, currentPoolEntry, ctx.requestedModel ?? null);
     return ctx.selectedBankedResetCandidate(evaluated, localCandidates, originalActive);
+  });
+
+  /**
+   * Run the one planned bounded overage attempt. The claim reuses the probe
+   * lease machinery (single-flight, generation/token fenced) and the
+   * active-selection admission fence; a serve returns its response, while any
+   * failure leaves the original refusal intact so the next request can still
+   * redeem.
+   */
+  const runOverageFallbackAttempt = (ctx.runOverageFallbackAttempt = async (): Promise<Response | null> => {
+    const pending = ctx.overageFallbackPending;
+    ctx.overageFallbackPending = null;
+    if (!pending) return null;
+    const claimed = await claimCodexRoutingProbe(ctx.poolEntry.pool, pending.routing);
+    if (!claimed) return null;
+    logCodexRouting("codex_overage_served", {
+      request_id: ctx.options.requestId ?? null,
+      account_id_hash: claimed.accountIdHash,
+      slot: claimed.slot + 1,
+      reason: pending.reason,
+    });
+    try {
+      const response = await ctx.fetchAttempt(
+        pending.accountEntry,
+        claimed.auth,
+        claimed,
+        "overage_fallback",
+        () => ensureOverageProbeLeaseCurrent(claimed),
+        true
+      );
+      if (response.ok) {
+        if (claimed.probeGeneration !== null) codexProbeByResponse.set(response, claimed);
+        return ctx.decorateAuthWarning(response);
+      }
+      if (response.status === 429) {
+        // Re-arm the durable fences from this fresh authoritative 429 exactly
+        // as an ordinary probe would, then keep the original refusal.
+        const disposition = await markCodexQuotaBlocked(claimed, response);
+        if (disposition.usageLimitReached && disposition.retryAtMs !== null) {
+          await ctx.captureBankedResetCandidate(pending.accountEntry, claimed, claimed.auth, disposition);
+        } else {
+          ctx.bankedResetCandidates.clear();
+        }
+      } else {
+        await releaseCodexRoutingProbe(claimed);
+      }
+      return null;
+    } catch {
+      await releaseCodexRoutingProbe(claimed);
+      return null;
+    }
   });
 
   const fetchAttempt = (ctx.fetchAttempt = async (
@@ -738,6 +863,7 @@ export const installCodexResponseOperations = (ctx: CodexResponseContext): void 
     preexistingBankedReset,
     selectedBankedResetCandidate,
     evaluateBlockedCohortBankedReset,
+    runOverageFallbackAttempt,
     fetchAttempt,
     refreshAfter401,
     classify429,
