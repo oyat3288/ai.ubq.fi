@@ -99,11 +99,7 @@ const paidFallbackInputError = (message: string): Response => openaiError(400, m
 
 const rejectRetiredApiKeyResetSetting = (raw: Record<string, unknown>): Response | null => {
   if (!Object.prototype.hasOwnProperty.call(raw, "banked_resets_enabled")) return null;
-  return openaiError(
-    400,
-    "banked_resets_enabled is retired; configure banked resets per Codex subscription",
-    "invalid_request_error"
-  );
+  return openaiError(400, "banked_resets_enabled is retired; configure banked resets per Codex subscription", "invalid_request_error");
 };
 
 const paidFallbackInitializationError = (error: unknown): Response => {
