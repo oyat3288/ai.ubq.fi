@@ -32,9 +32,10 @@ call. This document is the mapping from each retired job to the event that repla
 
 ## What an operator should expect
 
-- Capacity history converges on the next request or the next admin read: a normal capacity read is at most one 30-second
-  freshness window behind (`PROVIDER_CAPACITY_READ_FRESH_MS`), while the durable capacity history bucket remains fifteen
-  minutes. Paid-fallback terminal events and ledger reads schedule best-effort reconciliation; a ledger read can return
-  before settlement. `?refresh=live` on the capacity endpoint still forces an immediate probe.
+- Capacity history converges on the next request or the next admin read: a normal capacity read uses the 30-second
+  window (`PROVIDER_CAPACITY_READ_FRESH_MS`) to trigger revalidation, but if revalidation throws, the read returns the
+  last known snapshot, which may be older than 30 seconds. The durable capacity history bucket remains fifteen minutes.
+  Paid-fallback terminal events and ledger reads schedule best-effort reconciliation; a ledger read can return before
+  settlement. `?refresh=live` on the capacity endpoint still forces an immediate probe.
 - On a busy gateway the events arrive continuously, so cadence is effectively the same as the retired jobs were, without
   the idle-time work.
