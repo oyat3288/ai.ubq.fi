@@ -41,7 +41,6 @@ export const EVICTION_MAX_CHUNK_DELETES = 512;
 export const BOOTSTRAP_BATCH_ENTRIES = 32;
 export const RESERVATION_REAP_LIMIT = 8;
 export const STATUS_PRUNE_BATCH = 16;
-export const STATUS_PRUNE_SCAN = 128;
 export const CAS_ATTEMPTS = 5;
 const TEXT_ENCODER = new TextEncoder();
 const HEX_DIGEST = /^[0-9a-f]{64}$/;

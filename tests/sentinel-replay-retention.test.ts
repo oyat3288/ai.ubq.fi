@@ -27,6 +27,7 @@ import {
   advanceSentinelReplayStagingFence,
   evictSentinelReplays,
   prepareSentinelReplayPublication,
+  pruneCaptureOwnedStatusMetadata,
   readSentinelReplayRetentionStatus,
   reclaimExpiredSentinelReplays,
   reserveSentinelReplayCapacity,
@@ -1033,6 +1034,50 @@ Deno.test({
       assert.equal(ledger.status_pruned_records >= 1, true);
       assert.equal((await readSentinelReplayCaptureStatus(kv, "pressure-0")).status, SENTINEL_REPLAY_STATUS_NOT_RETAINED);
       assert.equal((await readSentinelReplayCaptureStatus(kv, "pressure-11")).status, "disabled", "the newest row survives");
+    } finally {
+      kv.close();
+      setKvForTest(null);
+    }
+  },
+});
+
+Deno.test({
+  name: "status pruning selects the oldest timestamp beyond the key-order scan",
+  ignore: !kvAvailable,
+  sanitizeResources: false,
+  sanitizeOps: false,
+  async fn() {
+    const kv = await Deno.openKv(":memory:");
+    const budgetBytes = 64 * 1_024;
+    const now = 1_700_600_000_000;
+    const oldestRequestId = "zzzz-oldest";
+    const newestRequestId = "request-000";
+    const statusRow = (requestId: string, capturedAtMs: number) => ({
+      version: 1,
+      request_id: requestId,
+      status: "disabled",
+      reason: "retention_pressure",
+      captured_at_ms: capturedAtMs,
+      manifest_key: null,
+      fingerprint: null,
+      expires_at_ms: null,
+    });
+    setKvForTest(kv);
+    try {
+      await kv.set(sentinelReplayRequestStatusKey(oldestRequestId), statusRow(oldestRequestId, now));
+      for (let index = 0; index < 128; index += 1) {
+        const requestId = `request-${index.toString().padStart(3, "0")}`;
+        await kv.set(sentinelReplayRequestStatusKey(requestId), statusRow(requestId, now + index + 1));
+      }
+      let maintenance = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now, budget_bytes: budgetBytes });
+      for (let pass = 0; pass < 20 && !maintenance.accounting_complete; pass += 1) {
+        maintenance = await runSentinelReplayRetentionMaintenance(kv, { now_ms: now, budget_bytes: budgetBytes });
+      }
+      assert.equal(maintenance.accounting_complete, true);
+
+      assert.equal(await pruneCaptureOwnedStatusMetadata(kv, now, 0, 0, 1, budgetBytes), 1);
+      assert.equal((await kv.get(sentinelReplayRequestStatusKey(oldestRequestId))).value, null);
+      assert.notEqual((await kv.get(sentinelReplayRequestStatusKey(newestRequestId))).value, null);
     } finally {
       kv.close();
       setKvForTest(null);

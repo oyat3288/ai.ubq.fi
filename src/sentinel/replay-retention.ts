@@ -80,7 +80,6 @@ import {
   sentinelReplayRequestStatusKey,
   sentinelReplayStatusMetadataBytes,
   STATUS_PRUNE_BATCH,
-  STATUS_PRUNE_SCAN,
   storedStatusMetadataBytes,
   type SentinelReplayAccountingRow,
   type SentinelReplayAdmission,
@@ -138,7 +137,7 @@ type StatusCandidate = Readonly<{ key: Deno.KvKey; versionstamp: string; bytes: 
 
 const statusCandidates = async (kv: Deno.Kv): Promise<StatusCandidate[] | null> => {
   const candidates: StatusCandidate[] = [];
-  for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_REQUEST_PREFIX }, { limit: STATUS_PRUNE_SCAN })) {
+  for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_REQUEST_PREFIX })) {
     if (!isSentinelReplayCaptureStatusRow(entry.value) || !metadataEntryMatches(entry, SENTINEL_REPLAY_REQUEST_PREFIX)) return null;
     candidates.push({
       key: entry.key,
@@ -147,7 +146,7 @@ const statusCandidates = async (kv: Deno.Kv): Promise<StatusCandidate[] | null> 
       captured_at_ms: entry.value.captured_at_ms,
     });
   }
-  for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_EVICTION_PREFIX }, { limit: STATUS_PRUNE_SCAN })) {
+  for await (const entry of kv.list({ prefix: SENTINEL_REPLAY_EVICTION_PREFIX })) {
     if (!metadataEntryMatches(entry, SENTINEL_REPLAY_EVICTION_PREFIX)) return null;
     const value = entry.value as { evicted_at_ms: number };
     candidates.push({
