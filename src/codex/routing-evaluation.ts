@@ -180,7 +180,8 @@ const evaluateCodexRoutingAccount = (
   const requestedQuotaClass = quotaClass(model);
   const classAwareSlot = withLegacyQuotaClassMap(slot);
   const requestedClassBlock = quotaBlockForClass(classAwareSlot, requestedQuotaClass);
-  const capacity = resolveCodexCapacityDecision(slot, classAwareSlot, requestedQuotaClass, observationsByAccount.get(account.accountIdHash), model, now);
+  const observation = observationsByAccount.get(account.accountIdHash);
+  const capacity = resolveCodexCapacityDecision(slot, classAwareSlot, requestedQuotaClass, observation, model, now);
   const routedAccount: CodexRoutedAccount = { ...account, quotaHeadroom: capacity.quotaHeadroom, routingGeneration: slot.generation };
   if (slot.invalid_credential_version === account.credentialVersion) {
     return skippedRoutingAccount(routedAccount, mapped.slot + 1, null, null, null, "credential_invalid");
@@ -199,11 +200,26 @@ const evaluateCodexRoutingAccount = (
     return skippedRoutingAccount(routedAccount, mapped.slot + 1, "quota", quotaSkip.retryAtMs, quotaSkip.blockedAccount, "quota_exhausted");
   }
   if (capacity.capacityExhausted) {
-    // A capacity-observed exhaustion carries no provider-proven reset identity.
-    // Keep the subscription half-open so a bounded probe can either serve the
-    // request or observe the authoritative 429 that re-arms the banked-reset
-    // fences. Refusing locally here strands every reset fence until the window
-    // resets, because no later request can ever re-observe the account.
+    // A fully used capacity observation with a future reset deadline is the
+    // authoritative quota block for that window: it must feed the blocked
+    // cohort so the automatic banked-reset flow can redeem (the deploy
+    // materializes the durable class block). Without a deadline, keep the
+    // subscription half-open so a bounded probe can re-observe the account.
+    const freshObservation = freshCapacityObservation(observation, now);
+    const observationResetAtMs = freshObservation?.windows.primary?.reset_at_ms ?? null;
+    if (observationResetAtMs !== null && Number.isSafeInteger(observationResetAtMs) && observationResetAtMs > now) {
+      return {
+        ...skippedRoutingAccount(
+          routedAccount,
+          mapped.slot + 1,
+          "quota",
+          observationResetAtMs,
+          { ...routedAccount, quotaResetAtMs: observationResetAtMs },
+          "quota_exhausted"
+        ),
+        capacityExhausted: true,
+      };
+    }
     return { ...routedRoutingAccount({ ...routedAccount, probeRequired: true, probeCircuit: "quota" }), capacityExhausted: true };
   }
   const leaseSkip = probeLeaseSkipFor(slot, requestedQuotaClass, now);
