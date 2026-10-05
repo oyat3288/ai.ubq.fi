@@ -166,6 +166,12 @@ export type RoutingAccount = Readonly<{
   probeToken: string | null;
   /** Circuit selected for a pending half-open probe. */
   probeCircuit?: CodexProbeCircuit | null;
+  /**
+   * Set only for the one bounded overage attempt that follows a blocked cohort
+   * proving no redeemable credit. The probe-claim allowance honors it for that
+   * attempt alone; it is never persisted.
+   */
+  overageFallback?: boolean;
   /** Durable routing generation observed when this account was selected. */
   routingGeneration?: number;
   /** Global active-account generation that admitted this request. */

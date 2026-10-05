@@ -73,6 +73,25 @@ keeps each quota window spend-once. Empty blocked cohorts log `codex_banked_rese
 at the time of the incident; it has since been replaced by one redemption per account per UTC day (see Configuration).
 The explicit per-account overage-usage setting remains approved-but-pending as recorded in `docs/DECISIONS.md`.
 
+## Overage usage setting
+
+Each Codex subscription has an "Allow overage spending" switch (default off) stored at
+`["uos_ai", "codex_overage_usage", "account", "v1", account_id_hash]` and served by
+`GET`/`PATCH /admin/providers/codex/overage-usage`. An absent row means off; changing the switch never calls OpenAI,
+never redeems, and never mutates banked-reset state.
+
+- Off (default): resets first. An exhausted account still evaluates the blocked cohort; only when that request cannot
+  redeem a reset (`no_eligible_credit`, empty or ineligible inventory, `inventory_unavailable`, or
+  `account_day_limit_reached`) does the gateway allow exactly one bounded overage probe for the active blocked account,
+  logging `codex_overage_served` with the redemption-unavailable reason. Arming (`live_armed`), a completed spend, and
+  fence/config failures never fall back, so the next request can still redeem.
+- On: a fully used capacity class with a future reset routes directly as the bounded half-open probe, and banked resets
+  still redeem when their gates pass.
+
+The fallback claim reuses the probe-lease machinery (one live attempt at a time) and the account's active-selection
+admission fence, so it never weakens the durable routing fences. The choice is per account; one subscription's switch
+never changes another account's routing.
+
 Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the ordinary
 retryable error in place. Malformed or unavailable durable routing state also fails retryably before dispatch; the
 gateway never guesses a sibling, deletes state, or advances the paid waterfall from an unproven cohort.
@@ -106,12 +125,12 @@ and daily-cap records are retained.
 
 Settings are re-read on each gateway request and immediately before the consume boundary.
 
-| Variable                                        | Safe default | Canary requirement                                                                                    |
-| ----------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
-| `CODEX_BANKED_RESET_ENABLED`                    | `true`       | `true` during shadow/live; `false` for fail-closed rollback.                                          |
-| `CODEX_BANKED_RESET_MODE`                       | `shadow`     | Canary: `shadow` -> `live` -> `shadow`; persistent rollout: `live`.                                   |
+| Variable                                        | Safe default | Canary requirement                                                              |
+| ----------------------------------------------- | ------------ | ------------------------------------------------------------------------------- |
+| `CODEX_BANKED_RESET_ENABLED`                    | `true`       | `true` during shadow/live; `false` for fail-closed rollback.                    |
+| `CODEX_BANKED_RESET_MODE`                       | `shadow`     | Canary: `shadow` -> `live` -> `shadow`; persistent rollout: `live`.             |
 | `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY`    | `0`          | Exactly `1` for any live submission; `0` (the fail-closed default) disables it. |
-| `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_WINDOW` | `1`          | Exactly `1`; every other value fails closed.                                                          |
+| `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_WINDOW` | `1`          | Exactly `1`; every other value fails closed.                                    |
 
 Shadow mode may GET inventory for stable blocked accounts and writes one redacted, deduplicated decision for that
 blocked episode. It makes zero consume calls. A repeated selected decision returns `already_would_spend_once` without a

@@ -46,17 +46,25 @@ Reversal risk: granting more than one redemption per account per day widens the 
 fabricates distinct exhaustion episodes; deleting or enforcing the retained legacy global_day rows would break the
 rollback path or reintroduce cross-account blocking.
 
-## Explicit per-account overage spending is approved - 2026-10-05 (implementation pending)
+## Explicit per-account overage spending is implemented - 2026-10-05
 
-Approved direction, not yet implemented:
+Implemented: every Codex subscription carries an "Allow overage spending" switch stored at
+`["uos_ai", "codex_overage_usage", "account", "v1", account_id_hash]` as `{ allow: boolean }`; an absent row is `false`
+and no existing record is rewritten. `GET`/`PATCH /admin/providers/codex/overage-usage` and the Providers view checkbox
+mirror the banked-reset settings surface. The default (false) keeps resets first: an exhausted account still routes
+through the banked-reset cohort, and only when that request cannot redeem a reset (`no_eligible_credit`, empty or
+ineligible inventory, `inventory_unavailable`, or the per-account daily cap) does one bounded overage probe serve the
+request, logging `codex_overage_served` with the redemption-unavailable reason. Arming (`live_armed`), a completed
+spend, and fence/config failures never fall back so the next request can still redeem. With the switch on, a
+capacity-100% exhaustion routes directly as the bounded half-open probe while banked resets still redeem when their
+gates pass. Changing the switch never calls OpenAI, never redeems, and never mutates banked-reset state. The approved
+spec is `docs/codex-overage-usage-toggle-spec.md`.
 
-- Add an explicit per-account overage-usage setting surfaced in the Providers view (checkbox) with default off, so
-  spending OpenAI overage credits is visible and deliberate. The intended policy is: prefer banked resets; allow overage
-  only when no banked resets remain for the account (or the operator explicitly enables overage).
+Reason: overage spending was previously invisible and implicit, and the global cap incident showed the gateway could
+silently prefer the paid backup balance over an available banked reset.
 
-Reason: overage spending was previously invisible and implicit.
-
-Reversal risk: enabling overage by default restores silent credit spending.
+Reversal risk: enabling overage by default restores silent credit spending; removing the fallback refusal reasons makes
+the gateway serve overage while a redeemable reset existed for the same request.
 
 ## Stage 1 key administration shows effective limits and audits every key change for 90 days - 2026-10-04
 

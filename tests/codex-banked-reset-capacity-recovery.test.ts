@@ -20,6 +20,7 @@ import {
   markCodexQuotaBlocked,
   markCodexSuccess,
   parseCodexAccountRoutingState,
+  pool,
   recordCodexCapacityRoutingObservations,
   required,
   resetCodexAccountRoutingForTest,
@@ -29,6 +30,7 @@ import {
   setKvForTest,
   singlePool,
 } from "./helpers/codex-account-routing-harness.ts";
+import { loadOverageUsageSettings, overageUsageAllowedSync, resetOverageUsageCacheForTest, writeOverageUsage } from "../src/codex/overage-settings.ts";
 import { sha256Hex } from "../src/utils.ts";
 
 type RoutingAuth = CodexAuthPoolState["accounts"][number];
@@ -348,5 +350,124 @@ Deno.test("a capacity observation that is not fresh never fabricates a probe ide
   } finally {
     setKvForTest(null);
     resetCodexAccountRoutingForTest();
+  }
+});
+
+Deno.test("an overage-allowed account routes the capacity exhaustion as a bounded probe without materializing a block", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  resetProviderSelectionCacheForTest();
+  resetOverageUsageCacheForTest();
+  try {
+    const now = 1_700_000_000_000;
+    const auth = harnessAuth(now);
+    await seedAuthPool(kv, auth, now);
+    await seedRoutingState(kv, auth, now, {
+      primary_used_percent: 100,
+      observed_reset_at_ms: now - 7 * DAY_MS,
+      observed_reset_at_is_stable: true,
+      banked_reset_generation_ambiguous: true,
+    });
+    const resetAtMs = now + 7 * DAY_MS;
+    await seedCapacityObservation({ snapshotAtMs: now + 1, resetAtMs, usedPercent: 100 });
+
+    // The operator explicitly allows overage for this subscription.
+    await writeOverageUsage(kv as unknown as Deno.Kv, await sha256Hex(auth.account_id), true);
+    resetOverageUsageCacheForTest();
+    await loadOverageUsageSettings(singlePool, true);
+    assert.equal(overageUsageAllowedSync(await routingAccountIdHash(auth.account_id)), true);
+
+    const selected = await selectCodexRoutingAccountsStrong(singlePool, singlePool.accounts, now + 2, LUNA);
+    assert.equal(selected.kind, "eligible");
+    const probeAccount = selected.accounts[0];
+    assert.equal(probeAccount.probeRequired, true);
+    assert.equal(probeAccount.probeCircuit, "quota");
+    assert.equal(probeAccount.quotaHeadroom, 0);
+    // The capacity-100% evidence must neither materialize nor block a class.
+    const state = parseCodexAccountRoutingState(kv.values.get(key(CODEX_ACCOUNT_ROUTING_KV_KEY)));
+    assert.equal(state?.slots[0]?.quota_blocks_by_class?.standard, undefined);
+    assert.equal(await getCodexQuotaBlockFence(probeAccount, resetAtMs), null);
+
+    const claimed = await claimCodexRoutingProbe(singlePool, probeAccount, now + 5);
+    assert.ok(claimed);
+    assert.equal(claimed.probeCircuit, "quota");
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+    resetOverageUsageCacheForTest();
+  }
+});
+
+Deno.test("one subscription's overage allowance never changes its sibling's blocked identity", async () => {
+  const kv = new RoutingKv();
+  setKvForTest(kv as unknown as Deno.Kv);
+  resetCodexAccountRoutingForTest();
+  resetProviderSelectionCacheForTest();
+  resetOverageUsageCacheForTest();
+  try {
+    const now = 1_700_000_000_000;
+    const first = { ...pool.accounts[0], updated_at_ms: now };
+    const second = { ...pool.accounts[1], updated_at_ms: now };
+    const twoPool: CodexAuthPoolState = { accounts: [first, second], updated_at_ms: now };
+    await kv.set(CODEX_AUTH_POOL_KV_KEY, twoPool);
+    await kv.set(CODEX_ACCOUNT_ROUTING_KV_KEY, {
+      v: 2 as const,
+      updated_at_ms: now,
+      slots: [
+        await routingSlot(first, {
+          primary_used_percent: 100,
+          observed_reset_at_ms: now - 7 * DAY_MS,
+          observed_reset_at_is_stable: true,
+          banked_reset_generation_ambiguous: true,
+        }),
+        await routingSlot(second, {
+          primary_used_percent: 100,
+          observed_reset_at_ms: now - 7 * DAY_MS,
+          observed_reset_at_is_stable: true,
+          banked_reset_generation_ambiguous: true,
+        }),
+      ],
+    });
+    const resetAtMs = now + 7 * DAY_MS;
+    await recordCodexCapacityRoutingObservations(
+      [
+        {
+          slot: 0,
+          account_id: "one",
+          state: "available",
+          source_observed_at_ms: now + 1,
+          snapshot_at_ms: now + 1,
+          windows: { primary: { limit_window_seconds: WEEKLY_WINDOW_SECONDS, used_percent: 100, reset_at_ms: resetAtMs }, secondary: null },
+          additional_rate_limits: [],
+        },
+        {
+          slot: 1,
+          account_id: "two",
+          state: "available",
+          source_observed_at_ms: now + 1,
+          snapshot_at_ms: now + 1,
+          windows: { primary: { limit_window_seconds: WEEKLY_WINDOW_SECONDS, used_percent: 100, reset_at_ms: resetAtMs }, secondary: null },
+          additional_rate_limits: [],
+        },
+      ],
+      now + 1
+    );
+    await writeOverageUsage(kv as unknown as Deno.Kv, await sha256Hex("one"), true);
+    resetOverageUsageCacheForTest();
+    await loadOverageUsageSettings(twoPool, true);
+
+    const selected = await selectCodexRoutingAccountsStrong(twoPool, twoPool.accounts, now + 2, LUNA);
+    assert.equal(selected.kind, "eligible");
+    assert.equal(selected.accounts.length, 1);
+    assert.equal(selected.accounts[0].auth.account_id, "one");
+    assert.equal(selected.accounts[0].probeRequired, true);
+    assert.equal(selected.blockedAccounts.length, 1);
+    assert.equal(selected.blockedAccounts[0].auth.account_id, "two");
+    assert.equal(selected.blockedAccounts[0].quotaResetAtMs, resetAtMs);
+  } finally {
+    setKvForTest(null);
+    resetCodexAccountRoutingForTest();
+    resetOverageUsageCacheForTest();
   }
 });

@@ -38,6 +38,13 @@ export type CodexRetryCandidate = Readonly<{
   expiresAtMs: number;
 }>;
 export type CodexResetCohortSnapshot = Readonly<{ poolJson: string; capacityJson: string }>;
+
+/** One bounded overage attempt planned by a blocked cohort that proved no redeemable credit. */
+export type PendingOverageFallback = Readonly<{
+  reason: string;
+  accountEntry: CodexDispatchAccountEntry;
+  routing: RoutingAccount;
+}>;
 export type EvaluatedBlockedReset = Readonly<{
   candidate: CodexBankedResetCandidate;
   reset: Awaited<ReturnType<typeof reconcileCodexBankedReset>>;
@@ -108,6 +115,7 @@ export type CodexResponseOperations = {
     originalActive: CodexActiveAccountSnapshot
   ) => EvaluatedBlockedReset | null;
   evaluateBlockedCohortBankedReset: () => Promise<EvaluatedBlockedReset | null>;
+  runOverageFallbackAttempt: () => Promise<Response | null>;
   fetchAttempt: (
     accountEntry: CodexAuthAccountEntry,
     auth: CodexAuthState,
@@ -260,6 +268,7 @@ export const createCodexResponseState = async (
     bankedResetCandidates,
     activeReselectionRequested,
     preservedShortRetryState,
+    overageFallbackPending: null as PendingOverageFallback | null,
   };
   return { kind: "state" as const, state };
 };
