@@ -836,7 +836,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "incident index requires super admin authorization before any storage access",
+  name: "incident index requires admin authorization and then reaches storage",
   ignore: !kvAvailable,
   sanitizeResources: false,
   sanitizeOps: false,
@@ -870,14 +870,16 @@ Deno.test({
         created_at_ms: now,
         expires_at_ms: now + 3_600_000,
       });
-      const forbidden = await handler(
+      // The former super-admin gate is gone: an admin passkey session now
+      // reads the same bounded index a token admin reads.
+      const adminSession = await handler(
         new Request(indexUrl(), {
           headers: { Cookie: `${PASSKEY_RELAY_COOKIE_NAME}=${encodeURIComponent(sessionToken)}` },
         })
       );
-      assert.equal(forbidden.status, 403);
-      const forbiddenPayload = (await forbidden.json()) as { error?: { message?: string } };
-      assert.equal(forbiddenPayload.error?.message, "Super admin token required");
+      assert.equal(adminSession.status, 200);
+      const adminPayload = (await adminSession.json()) as { data?: unknown };
+      assert.equal(Array.isArray(adminPayload.data), true);
     } finally {
       adminTokens.delete(SUPER_ADMIN_TOKEN);
       kv.close();

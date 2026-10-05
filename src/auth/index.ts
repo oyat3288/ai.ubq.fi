@@ -653,13 +653,6 @@ export const requireAdminAuth = async (req: Request): Promise<Response | null> =
   return result.ok ? null : result.response;
 };
 
-export const requireSuperAdminAuth = async (req: Request): Promise<Response | null> => {
-  const result = await authenticateAdmin(req);
-  if (!result.ok) return result.response;
-  if (result.is_super_admin) return null;
-  return openaiError(403, "Super admin token required", "forbidden");
-};
-
 type ReportedAuthMethod = AdminAuthMethod | ClientAuthMethod;
 
 type V1ApiKeyMethodResult = Readonly<{ ok: true; key: Record<string, unknown> }> | Readonly<{ ok: false; response: Response }>;

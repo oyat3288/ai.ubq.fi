@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { authenticateAdmin, authenticateClient, handleV1Auth, requireSuperAdminAuth } from "../src/auth/index.ts";
+import { authenticateAdmin, authenticateClient, handleV1Auth } from "../src/auth/index.ts";
 import {
   configureAdminAuthForListener,
   configureAdminAuthPeerForRequest,
@@ -118,7 +118,6 @@ Deno.test("guarded runtime bypass grants local super-admin access only to loopba
       assert.equal(localAuth.method.kind, "disabled");
       assert.equal(localAuth.is_super_admin, true);
     }
-    assert.equal(await requireSuperAdminAuth(localRequest), null);
 
     // Explicit listener bypass also covers clients outside the legacy dev-host list.
     const loopbackClient = await authenticateClient(new Request("http://127.42.9.3/v1/models"));

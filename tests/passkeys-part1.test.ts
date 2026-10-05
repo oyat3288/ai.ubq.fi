@@ -233,7 +233,7 @@ Deno.test("passkey session authenticates as client and admin", async () => {
   assert.equal(sessionBody.user.credential_count, 1);
 });
 
-Deno.test("admin passkey sessions cannot read the super-admin Stage 0 diagnostic", async () => {
+Deno.test("an admin passkey session reaches the former super-admin Stage 0 diagnostic", async () => {
   kvStore.clear();
   const { token } = seedPasskeySession();
   const { default: handler } = await import("../src/handler/index.ts");
@@ -243,9 +243,14 @@ Deno.test("admin passkey sessions cannot read the super-admin Stage 0 diagnostic
     })
   );
 
-  assert.equal(response.status, 403);
+  // The super-admin gate is gone: the request reaches the diagnostic handler
+  // (200 when the baseline reads, 503 when the harness KV cannot serve it),
+  // and it is never refused as forbidden or unauthorized.
+  assert.notEqual(response.status, 401);
+  assert.notEqual(response.status, 403);
+  assert.ok([200, 503].includes(response.status), `unexpected status ${response.status}`);
   const body = (await response.json()) as { error?: { code?: unknown } };
-  assert.equal(body.error?.code, "forbidden");
+  assert.notEqual(body.error?.code, "forbidden");
 });
 
 Deno.test("non-admin passkey session authenticates as client but not admin", async () => {

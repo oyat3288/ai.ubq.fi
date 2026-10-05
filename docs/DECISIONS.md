@@ -6,6 +6,22 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Every admin gets the full console; super-admin route gating is removed - 2026-10-05
+
+Admin authentication is unchanged: admin tokens, allowlist tokens, Deno Deploy tokens, and admin passkey sessions still
+authenticate, and unauthenticated requests still 401. The console now has no super-admin tier: every `/admin` route in
+`src/handler/index.ts` is registered without a `superAdmin` gate, `requireSuperAdminAuth` is removed, every registered
+view (including Supervisor and passkey users) renders for any signed-in admin, and any authenticated admin may register
+another admin passkey. The `is_super_admin` flag survives only where it describes the credential that authenticated
+(`/v1/auth` reporting and API-key audit rows), never as an admin-route gate.
+
+Reason: the owner required one admin console with no differences for super admins; the split hid Supervisor, passkey
+users, migration, and incident/replay tooling from working admins who operate them.
+
+Reversal risk: removing the restriction widens the blast radius of a compromised normal admin credential to every admin
+action (KV migration import, incident and replay export, supervisor reads, passkey administration); restore the
+per-route gates if that trade stops being acceptable.
+
 ## Capacity-observed exhaustion feeds the blocked cohort and materializes the reset fence - 2026-10-05
 
 A fresh capacity observation that shows the requested quota class at 100% used with a future reset deadline is now

@@ -84,11 +84,10 @@ type ExactRouteEntry = Readonly<{
 /** The authenticated admin identity and request id handed to key mutations. */
 type AdminRouteContext = Readonly<{ auth: AdminAuthResult; requestId: string }>;
 
-/** An admin route, optionally restricted to super admins. */
+/** An authenticated admin route. Every admin credential reaches every route. */
 type AdminRouteEntry = Readonly<{
   methods: readonly string[];
   path: string;
-  superAdmin?: true;
   run: (req: Request, context: AdminRouteContext) => Response | Promise<Response>;
 }>;
 
@@ -121,8 +120,8 @@ const AUTH_ROUTES: readonly ExactRouteEntry[] = [
 
 /** Admin API routes in wire order; every one authenticates before dispatch. */
 const ADMIN_ROUTES: readonly AdminRouteEntry[] = [
-  { methods: ["GET"], path: "/admin/passkey-users", superAdmin: true, run: () => handlePasskeyUsersList() },
-  { methods: ["PATCH"], path: "/admin/passkey-users", superAdmin: true, run: (req) => handlePasskeyUsersUpdate(req) },
+  { methods: ["GET"], path: "/admin/passkey-users", run: () => handlePasskeyUsersList() },
+  { methods: ["PATCH"], path: "/admin/passkey-users", run: (req) => handlePasskeyUsersUpdate(req) },
   { methods: ["POST"], path: "/admin/codex/auth", run: (req) => handleAdminCodexAuth(req) },
   { methods: ["GET", "PATCH"], path: "/admin/providers/codex/banked-resets", run: (req) => handleAdminCodexResetSettings(req) },
   { methods: ["GET", "PATCH"], path: "/admin/providers/codex/overage-usage", run: (req) => handleAdminCodexOverageUsage(req) },
@@ -130,10 +129,9 @@ const ADMIN_ROUTES: readonly AdminRouteEntry[] = [
   {
     methods: ["GET"],
     path: "/admin/providers/codex/cache-scope-experiment",
-    superAdmin: true,
     run: () => handleAdminCodexCacheScopeExperimentTelemetryBaseline(),
   },
-  { methods: ["POST"], path: "/admin/providers/codex/cache-scope-experiment", superAdmin: true, run: (req) => handleAdminCodexCacheScopeExperiment(req) },
+  { methods: ["POST"], path: "/admin/providers/codex/cache-scope-experiment", run: (req) => handleAdminCodexCacheScopeExperiment(req) },
   { methods: ["GET"], path: "/admin/codex/models", run: () => handleAdminCodexModelsGet() },
   { methods: ["POST"], path: "/admin/codex/models", run: (req) => handleAdminCodexModelsSet(req) },
   { methods: ["GET"], path: "/admin/models/whitelist", run: () => handleAdminCodexModelsWhitelistGet() },
@@ -141,13 +139,13 @@ const ADMIN_ROUTES: readonly AdminRouteEntry[] = [
   { methods: ["POST"], path: "/admin/models/refresh", run: () => handleAdminModelsRefresh() },
   { methods: ["POST"], path: "/admin/models/whitelist", run: (req) => handleAdminCodexModelsWhitelistSet(req) },
   { methods: ["POST"], path: "/admin/codex/prompts/purge", run: () => handleAdminCodexPromptsPurge() },
-  { methods: ["POST"], path: "/admin/kv-migration/import", superAdmin: true, run: (req) => handleAdminKvMigrationImport(req) },
-  { methods: ["GET"], path: "/admin/kv-migration/validate", superAdmin: true, run: () => handleAdminKvMigrationValidate() },
-  { methods: ["GET"], path: "/admin/sentinel/replay-captures", superAdmin: true, run: (req) => handleAdminSentinelReplayCaptures(req) },
-  { methods: ["GET"], path: "/admin/sentinel/incidents", superAdmin: true, run: (req) => handleAdminSentinelIncidents(req) },
-  { methods: ["GET"], path: "/admin/codex/supervisor/sessions", superAdmin: true, run: () => handleAdminCodexSupervisorSessions() },
-  { methods: ["GET"], path: "/admin/codex/supervisor/output", superAdmin: true, run: (req) => handleAdminCodexSupervisorOutput(req) },
-  { methods: ["POST"], path: "/admin/codex/supervisor/brief", superAdmin: true, run: (req) => handleAdminCodexSupervisorBrief(req) },
+  { methods: ["POST"], path: "/admin/kv-migration/import", run: (req) => handleAdminKvMigrationImport(req) },
+  { methods: ["GET"], path: "/admin/kv-migration/validate", run: () => handleAdminKvMigrationValidate() },
+  { methods: ["GET"], path: "/admin/sentinel/replay-captures", run: (req) => handleAdminSentinelReplayCaptures(req) },
+  { methods: ["GET"], path: "/admin/sentinel/incidents", run: (req) => handleAdminSentinelIncidents(req) },
+  { methods: ["GET"], path: "/admin/codex/supervisor/sessions", run: () => handleAdminCodexSupervisorSessions() },
+  { methods: ["GET"], path: "/admin/codex/supervisor/output", run: (req) => handleAdminCodexSupervisorOutput(req) },
+  { methods: ["POST"], path: "/admin/codex/supervisor/brief", run: (req) => handleAdminCodexSupervisorBrief(req) },
   { methods: ["GET"], path: "/admin/errors", run: (req) => handleAdminErrors(req) },
   { methods: ["GET", "POST"], path: "/admin/defaults", run: (req) => handleAdminDefaults(req) },
   { methods: ["GET", "POST", "DELETE"], path: "/admin/debug/routing", run: (req) => handleAdminDebugRouting(req) },
@@ -216,7 +214,9 @@ const handleAuthRoute = async (req: Request, path: string): Promise<Response | n
     const auth = await authenticateAdmin(req);
     if (!auth.ok) return auth.response;
     return await handlePasskeyRegisterStart(req, {
-      defaultIsAdmin: auth.is_super_admin,
+      // Every authenticated admin may register another admin passkey: the
+      // console no longer has a super-admin tier.
+      defaultIsAdmin: true,
       authenticatedPasskeyToken: auth.method.kind === "passkey_session" ? auth.token : undefined,
     });
   }
@@ -253,9 +253,6 @@ const handleAdminRoute = async (req: Request, path: string, requestId: string): 
   if (route) {
     const auth = await authenticateAdmin(req);
     if (!auth.ok) return auth.response;
-    if (route.superAdmin && !auth.is_super_admin) {
-      return openaiError(403, "Super admin token required", "forbidden");
-    }
     return await route.run(req, { auth, requestId });
   }
   const recheckMatch = /^\/admin\/providers\/codex\/(\d+)\/recheck$/.exec(path);

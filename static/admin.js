@@ -434,10 +434,6 @@ const updateLoadingAuthStatus = () => {
     setLoadingStatus("auth", "unknown", "Checking");
     return;
   }
-  if (adminAccessState.isSuperAdmin) {
-    setLoadingStatus("auth", "ok", "Super admin");
-    return;
-  }
   if (adminAccessState.isAdmin) {
     setLoadingStatus("auth", "ok", "Admin");
     return;
@@ -6789,7 +6785,7 @@ const refreshPasskeyUsers = async () => {
       setPasskeyUsersBadge("bad", data?.error?.message ?? "Error");
       setPasskeyUsersMessage(
         res.status === 403
-          ? "Super admin token required. Paste a Deno/admin token in the fallback token field."
+          ? "Admin token required. Paste a Deno/admin token in the fallback token field."
           : "Failed to load passkey users.",
       );
       return;
@@ -6876,7 +6872,7 @@ const VIEW_HASHES = {
 };
 const VIEW_REQUIREMENTS = {
   keys: "admin",
-  users: "super-admin",
+  users: "admin",
   kernel: "admin",
   pubkeys: "admin",
   defaults: "admin",
@@ -6884,7 +6880,7 @@ const VIEW_REQUIREMENTS = {
   analytics: "admin",
   providers: "admin",
   errors: "admin",
-  supervisor: "super-admin",
+  supervisor: "admin",
 };
 const VIEW_HASH_ALIASES = new Map([
   ["loading", "loading"],
@@ -6924,10 +6920,7 @@ const normalizeAdminView = (view) => viewSections[view] ? view : ADMIN_VIEW_DEFA
 
 const canAccessView = (view) => {
   if (view === "loading") return true;
-  const requirement = VIEW_REQUIREMENTS[view];
-  if (requirement === "super-admin") return adminAccessState.isSuperAdmin === true;
-  if (requirement === "admin") return adminAccessState.isAdmin === true;
-  return false;
+  return VIEW_REQUIREMENTS[view] === "admin" && adminAccessState.isAdmin === true;
 };
 
 const setTabState = (tab, selected, enabled = true) => {
@@ -6936,8 +6929,7 @@ const setTabState = (tab, selected, enabled = true) => {
   tab.disabled = !enabled;
   tab.tabIndex = enabled && selected ? 0 : -1;
   if (!enabled) {
-    const label = tab.id === "view-tab-users" ? "Super admin required" : "Admin sign-in required";
-    tab.title = label;
+    tab.title = "Admin sign-in required";
   } else {
     tab.removeAttribute("title");
   }
@@ -7004,7 +6996,6 @@ const viewSections = {
 
 const supervisorView = createSupervisorView({
   section: viewSupervisor,
-  isSuperAdmin: () => adminAccessState.isSuperAdmin === true,
   getToken: getAdminToken,
   apiUrl,
 });
@@ -7230,8 +7221,8 @@ const startAdminPrefetch = () => {
     },
     {
       key: "users",
-      allowed: () => adminAccessState.isSuperAdmin === true,
-      skippedText: "Super admin",
+      allowed: () => adminAccessState.isAdmin === true,
+      skippedText: "Admin sign-in required",
       load: refreshPasskeyUsers,
       ready: () => passkeyUsersLoadedAt > 0,
     },
@@ -7355,11 +7346,7 @@ const setAdminAccessState = (next) => {
     isAdmin: next?.isAdmin === true,
     isSuperAdmin: next?.isSuperAdmin === true,
   };
-  document.body.dataset.authScope = adminAccessState.isSuperAdmin
-    ? "super-admin"
-    : adminAccessState.isAdmin
-    ? "admin"
-    : "none";
+  document.body.dataset.authScope = adminAccessState.isAdmin ? "admin" : "none";
   updateLoadingAuthStatus();
   syncLoadingGate();
   updateViewAccess();
@@ -9706,7 +9693,7 @@ const hydrateAdminSnapshots = async () => {
   }
 
   const users = cachedList(usersSnapshot);
-  if (adminAccessState.isSuperAdmin && users && passkeyUsersLoadedAt <= usersSnapshot.savedAt) {
+  if (adminAccessState.isAdmin && users && passkeyUsersLoadedAt <= usersSnapshot.savedAt) {
     passkeyUsers = users;
     passkeyUsersLoadedAt = usersSnapshot.savedAt;
     renderPasskeyUsers(passkeyUsers);
