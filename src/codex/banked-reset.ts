@@ -91,7 +91,8 @@ export const parseCodexBankedResetConfig = (readEnv: (key: string) => string | u
   enabled: parseStrictBoolean(readEnv("CODEX_BANKED_RESET_ENABLED"), true),
   mode: parseMode(readEnv("CODEX_BANKED_RESET_MODE")),
   // The retired CODEX_BANKED_RESET_MAX_GLOBAL_PER_DAY environment is no longer read.
-  maxPerAccountPerDay: parseNonNegativeInteger(readEnv("CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY"), 1),
+  // Fail closed like the retired global cap: an absent cap disables live submissions until an explicit 1 is configured.
+  maxPerAccountPerDay: parseNonNegativeInteger(readEnv("CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY"), 0),
   maxPerAccountPerWindow: parseNonNegativeInteger(readEnv("CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_WINDOW"), 1),
 });
 

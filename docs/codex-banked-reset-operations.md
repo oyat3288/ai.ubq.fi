@@ -110,7 +110,7 @@ Settings are re-read on each gateway request and immediately before the consume 
 | ----------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
 | `CODEX_BANKED_RESET_ENABLED`                    | `true`       | `true` during shadow/live; `false` for fail-closed rollback.                                          |
 | `CODEX_BANKED_RESET_MODE`                       | `shadow`     | Canary: `shadow` -> `live` -> `shadow`; persistent rollout: `live`.                                   |
-| `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY`    | `1`          | Exactly `1`; live rejects every other value (terminal-outcome providers report the dedicated reason). |
+| `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY`    | `0`          | Exactly `1` for any live submission; `0` (the fail-closed default) disables it. |
 | `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_WINDOW` | `1`          | Exactly `1`; every other value fails closed.                                                          |
 
 Shadow mode may GET inventory for stable blocked accounts and writes one redacted, deduplicated decision for that

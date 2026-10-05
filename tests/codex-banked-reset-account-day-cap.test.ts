@@ -110,7 +110,8 @@ Deno.test("live mode requires an exact per-account daily cap of one and shadow n
   assert.equal(declared.mode, "live");
   assert.equal(declared.maxPerAccountPerDay, 2);
   const retired = parseCodexBankedResetConfig((key) => (key === "CODEX_BANKED_RESET_MAX_GLOBAL_PER_DAY" ? "0" : undefined));
-  assert.equal(retired.maxPerAccountPerDay, 1);
+  // Fail closed: the retired global variable is ignored and an absent new cap stays disabled.
+  assert.equal(retired.maxPerAccountPerDay, 0);
   assert.equal("maxGlobalPerDay" in retired, false);
 
   const kv = new MemoryKv();
