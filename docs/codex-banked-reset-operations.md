@@ -88,9 +88,15 @@ never redeems, and never mutates banked-reset state.
 - On: a fully used capacity class with a future reset routes directly as the bounded half-open probe, and banked resets
   still redeem when their gates pass.
 
-The fallback claim reuses the probe-lease machinery (one live attempt at a time) and the account's active-selection
-admission fence, so it never weakens the durable routing fences. The choice is per account; one subscription's switch
-never changes another account's routing.
+The fallback claim reuses the probe-lease machinery (one live attempt at a time) under a scoped pre-transport lease
+fence, so it never weakens the durable routing fences. The choice is per account; one subscription's switch never
+changes another account's routing.
+
+The Providers diagnostics panel shows the banked-reset credit expiries (`credits` on the reset-settings GET, earliest
+first, with raw credit ids never included) and, when the upstream usage read succeeds, the account's overage balance
+string plus the `overage_limit_reached` flag from `GET /admin/providers/codex/overage-usage`. Both reads share the
+five-second bound; an unavailable or malformed upstream reports nulls instead of stale or zero values, and the switch
+itself renders as a plain `true`/`false` state.
 
 Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the ordinary
 retryable error in place. Malformed or unavailable durable routing state also fails retryably before dispatch; the

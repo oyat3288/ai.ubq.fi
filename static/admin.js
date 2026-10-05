@@ -1074,6 +1074,48 @@ const capacityProviderStatus = (source, provider) => {
   };
 };
 
+/** Diagnostics-only credit expiry line value; null expiries stay explicit. */
+const formatCreditExpiry = (value) =>
+  typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : "expiry unavailable";
+
+/**
+ * Two compact diagnostics rows inside the existing details panel: banked-reset
+ * expiry evidence and the last overage balance. Each row appears only when its
+ * endpoint returned usable data, so an unavailable upstream adds no noise.
+ */
+const appendCodexResetDiagnostics = (diagnostics, resetSetting, overageSetting) => {
+  const facts = document.createElement("dl");
+  facts.dataset.capacityMeta = "";
+  let wrote = false;
+  const credits = Array.isArray(resetSetting?.credits) ? resetSetting.credits : null;
+  if (resetSetting && (Number.isSafeInteger(resetSetting.available_count) || credits)) {
+    const count = Number.isSafeInteger(resetSetting.available_count)
+      ? String(resetSetting.available_count) + " available"
+      : "count unavailable";
+    const expires = credits && credits.length
+      ? credits.map((credit) => formatCreditExpiry(credit?.expires_at_ms)).join(", ")
+      : "expiry unavailable";
+    appendProviderFact(facts, "Banked resets", count + " \u2014 expires " + expires);
+    wrote = true;
+  }
+  if (overageSetting) {
+    const overage = overageSetting.overage;
+    if (!overage) {
+      appendProviderFact(facts, "Overage balance", "usage unavailable");
+    } else {
+      const balance = typeof overage.balance === "string" && overage.balance.trim() ? overage.balance : "unavailable";
+      const limit = overage.overage_limit_reached === true
+        ? "reached"
+        : overage.overage_limit_reached === false
+        ? "not reached"
+        : "unknown";
+      appendProviderFact(facts, "Overage balance", balance + " \u2014 limit " + limit);
+    }
+    wrote = true;
+  }
+  if (wrote) diagnostics.appendChild(facts);
+};
+
 const appendCapacitySourceMeta = (row, source, provider = null) => {
   const facts = document.createElement("dl");
   facts.dataset.capacityMeta = "";
@@ -1215,7 +1257,7 @@ const renderCodexCapacitySource = (source, provider = null) => {
   overageCopy.textContent = "Allow overage spending";
   const overageState = document.createElement("small");
   const applyOverageState = (allow) => {
-    overageState.textContent = allow ? "Overage allowed" : "Resets first";
+    overageState.textContent = allow ? "true" : "false";
   };
   applyOverageState(overageSetting?.allow === true);
   const overageInput = document.createElement("input");
@@ -1274,6 +1316,7 @@ const renderCodexCapacitySource = (source, provider = null) => {
   appendCapacitySourceMeta(row, source, provider);
   const diagnostics = row.querySelector("details");
   for (const limit of additionalLimits) renderCapacityAdditionalLimit(diagnostics, limit);
+  appendCodexResetDiagnostics(diagnostics, setting, overageSetting);
   return row;
 };
 

@@ -1,7 +1,10 @@
 // Admin kernel, quota projection and reset settings handlers, split out of src/admin.ts.
 
 import { config } from "../config.ts";
-import { readCodexResetAvailableCount } from "../codex/banked-reset-provider.ts";
+import { readCodexResetAvailableCount, readCodexResetCredits } from "../codex/banked-reset-provider.ts";
+import type { CodexResetCreditDiagnostic } from "../codex/banked-reset-provider.ts";
+import { codexUsageUrl, parseCodexOverageUsage } from "../provider/capacity-parse.ts";
+import type { ProviderCapacityOverageUsage } from "../provider/capacity-parse.ts";
 import { codexResetUsageKey, readCodexResetUsage } from "../codex/reset-settings.ts";
 import { loadOverageUsageSettings, readOverageUsage, writeOverageUsage } from "../codex/overage-settings.ts";
 import { getAuthPoolEntry } from "../codex/auth.ts";
@@ -566,22 +569,28 @@ export const handleAdminCodexResetSettings = async (request: Request): Promise<R
     identities.map(async (account, index) => {
       const enabled = (await readCodexResetUsage(kv, account.account_id_hash)).allowed;
       let availableCount: number | null = null;
+      let credits: readonly CodexResetCreditDiagnostic[] | null = null;
+      const credentials = accounts.at(index);
+      const diagnosticsSignal = AbortSignal.any([request.signal, AbortSignal.timeout(5000)]);
+      const inventoryOptions = credentials && {
+        codexBaseUrl: config.codexBaseUrl,
+        accountId: credentials.account_id,
+        accessToken: credentials.access_token,
+        userAgent: "codex_cli_rs/0.100.0 (ai.ubq.fi)",
+      };
       try {
-        const credentials = accounts.at(index);
-        if (!credentials) throw new Error("codex reset settings account disappeared");
-        availableCount = await readCodexResetAvailableCount(
-          {
-            codexBaseUrl: config.codexBaseUrl,
-            accountId: credentials.account_id,
-            accessToken: credentials.access_token,
-            userAgent: "codex_cli_rs/0.100.0 (ai.ubq.fi)",
-          },
-          AbortSignal.any([request.signal, AbortSignal.timeout(5000)])
-        );
+        if (!inventoryOptions) throw new Error("codex reset settings account disappeared");
+        availableCount = await readCodexResetAvailableCount(inventoryOptions, diagnosticsSignal);
       } catch {
         /* An unavailable count must not appear as zero or block the switch. */
       }
-      return { ...account, enabled, available_count: availableCount };
+      try {
+        if (!inventoryOptions) throw new Error("codex reset settings account disappeared");
+        credits = await readCodexResetCredits(inventoryOptions, diagnosticsSignal);
+      } catch {
+        /* Expiries are diagnostics only: an unavailable list reads as null. */
+      }
+      return { ...account, enabled, available_count: availableCount, credits };
     })
   );
   return json(200, { data }, { "Cache-Control": "no-store" });
@@ -614,12 +623,45 @@ export const handleAdminCodexOverageUsage = async (request: Request): Promise<Re
   // just-confirmed change without waiting for its bounded revalidation.
   await refreshOverageUsageRoutingCache();
   const data = await Promise.all(
-    identities.map(async (account) => ({
+    identities.map(async (account, index) => ({
       ...account,
       allow: await readOverageUsage(kv, account.account_id_hash),
+      overage: await readOverageUsageDiagnostics(accounts.at(index), AbortSignal.any([request.signal, AbortSignal.timeout(5000)])),
     }))
   );
   return json(200, { data }, { "Cache-Control": "no-store" });
+};
+
+/**
+ * Diagnostics-only read of the upstream usage endpoint with the capacity
+ * sampler's exact headers and user agent. Any failure (HTTP, malformed body,
+ * timeout) reads as null so the switch still renders; no other field is kept.
+ */
+const readOverageUsageDiagnostics = async (
+  account: Readonly<{ account_id: string; access_token: string }> | undefined,
+  signal: AbortSignal
+): Promise<ProviderCapacityOverageUsage | null> => {
+  if (!account) return null;
+  try {
+    const response = await fetch(codexUsageUrl(), {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: "Bearer " + account.access_token,
+        "ChatGPT-Account-ID": account.account_id,
+        "User-Agent": "codex_cli_rs/0.100.0 (ai.ubq.fi)",
+      },
+      redirect: "manual",
+      signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      return null;
+    }
+    return parseCodexOverageUsage(await response.json());
+  } catch {
+    return null;
+  }
 };
 
 /** Best-effort refresh of the routing-facing cache from the live auth pool. */

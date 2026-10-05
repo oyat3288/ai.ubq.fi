@@ -940,6 +940,65 @@ Deno.test("codex reset settings list and patch the account switch", async () => 
   assert.equal((await readCodexResetUsage(kv as unknown as Deno.Kv, accountIdHash)).allowed, true);
 });
 
+Deno.test("codex reset settings expose bounded credit expiries without raw credit ids", async () => {
+  const originalFetch = globalThis.fetch;
+  kv.clearData();
+  kv.seed(CODEX_AUTH_POOL_KEY, codexPoolEntry("account-reset-credits-1"));
+  const credit = (id: string, expiresAt: string) => ({
+    id,
+    status: "available",
+    reset_type: "codex_rate_limits",
+    expires_at: expiresAt,
+  });
+  const stub = (inventory: () => Response | Promise<Response>) => {
+    globalThis.fetch = (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (!url.endsWith("/backend-api/wham/rate-limit-reset-credits")) throw new Error(`unexpected request ${url}`);
+      return Promise.resolve(inventory());
+    };
+  };
+  try {
+    // The detailed list is sorted by earliest expiry and never carries the raw id.
+    stub(() =>
+      Response.json({
+        available_count: 2,
+        credits: [credit("opaque-late-credit", "2026-10-20T00:00:00Z"), credit("opaque-soon-credit", "2026-10-12T00:00:00Z")],
+      })
+    );
+    const listed = await handleAdminCodexResetSettings(new Request("https://ai.ubq.fi/admin/providers/codex/banked-resets"));
+    assert.equal(listed.status, 200);
+    const rows = (await readBody(listed)).data as {
+      available_count: number | null;
+      credits: { status: string; expires_at_ms: number | null }[] | null;
+    }[];
+    assert.equal(rows[0].available_count, 2);
+    assert.deepEqual(rows[0].credits, [
+      { status: "available", expires_at_ms: Date.parse("2026-10-12T00:00:00Z") },
+      { status: "available", expires_at_ms: Date.parse("2026-10-20T00:00:00Z") },
+    ]);
+    assert.equal(JSON.stringify(rows[0]).includes("opaque"), false, "raw credit ids never reach the admin surface");
+
+    // A capped or mismatched detailed list is refused for diagnostics only: the
+    // count still renders and the credits read as unavailable.
+    stub(() => Response.json({ available_count: 2, credits: [credit("opaque-only-credit", "2026-10-12T00:00:00Z")] }));
+    const capped = await handleAdminCodexResetSettings(new Request("https://ai.ubq.fi/admin/providers/codex/banked-resets"));
+    assert.equal(capped.status, 200);
+    const cappedRow = ((await readBody(capped)).data as { available_count: number | null; credits: unknown }[])[0];
+    assert.equal(cappedRow.available_count, 2);
+    assert.equal(cappedRow.credits, null);
+
+    // An unavailable upstream yields nulls while the endpoint still succeeds.
+    stub(() => new Response(null, { status: 500 }));
+    const unavailable = await handleAdminCodexResetSettings(new Request("https://ai.ubq.fi/admin/providers/codex/banked-resets"));
+    assert.equal(unavailable.status, 200);
+    const unavailableRow = ((await readBody(unavailable)).data as { available_count: number | null; credits: unknown }[])[0];
+    assert.equal(unavailableRow.available_count, null);
+    assert.equal(unavailableRow.credits, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test("codex reset settings patch rejects invalid bodies and stale subscriptions", async () => {
   kv.clearData();
   kv.seed(CODEX_AUTH_POOL_KEY, codexPoolEntry("account-coverage-2"));
