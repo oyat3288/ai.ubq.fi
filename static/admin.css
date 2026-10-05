@@ -1024,6 +1024,17 @@ body[data-page="admin"] [data-capacity-window] {
   background: var(--surface);
 }
 
+/* Banked-reset diagnostics: one compact row per expiring credit. */
+body[data-page="admin"] [data-banked-reset-diagnostics] ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 body[data-page="admin"] [data-capacity-usage] {
   display: grid;
   gap: 8px;

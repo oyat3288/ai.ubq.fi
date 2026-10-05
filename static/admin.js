@@ -1070,31 +1070,71 @@ const capacityProviderStatus = (source, provider) => {
   };
 };
 
-/** Diagnostics-only credit expiry line value; null expiries stay explicit. */
+/** Diagnostics-only credit expiry text in the viewer's local zone; null stays explicit. */
 const formatCreditExpiry = (value) =>
-  typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : "expiry unavailable";
+  typeof value === "number" && Number.isFinite(value)
+    ? new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short", timeZoneName: "short" })
+    : "expiry unavailable";
+
+/** A short integer-day hint for a future credit expiry; unknown values add nothing. */
+const creditExpiryHint = (value, nowMs = Date.now()) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "";
+  const days = Math.round((value - nowMs) / 86_400_000);
+  if (days <= 0) return "(today)";
+  return days === 1 ? "(in 1 day)" : "(in " + days + " days)";
+};
 
 /**
- * Two compact diagnostics rows inside the existing details panel: banked-reset
- * expiry evidence and the last overage balance. Each row appears only when its
- * endpoint returned usable data, so an unavailable upstream adds no noise.
+ * Diagnostics inside the existing details panel: a per-credit banked-reset
+ * expiry list plus the last overage balance row. Each block appears only when
+ * its endpoint returned usable data, so an unavailable upstream adds no noise.
  */
 const appendCodexResetDiagnostics = (diagnostics, resetSetting, overageSetting) => {
-  const facts = document.createElement("dl");
-  facts.dataset.capacityMeta = "";
-  let wrote = false;
-  const credits = Array.isArray(resetSetting?.credits) ? resetSetting.credits : null;
+  const credits = Array.isArray(resetSetting?.credits)
+    ? [...resetSetting.credits].sort((
+      left,
+      right,
+    ) => ((left?.expires_at_ms ?? Number.POSITIVE_INFINITY) - (right?.expires_at_ms ?? Number.POSITIVE_INFINITY)))
+    : null;
   if (resetSetting && (Number.isSafeInteger(resetSetting.available_count) || credits)) {
-    const count = Number.isSafeInteger(resetSetting.available_count)
-      ? String(resetSetting.available_count) + " available"
-      : "count unavailable";
-    const expires = credits && credits.length
-      ? credits.map((credit) => formatCreditExpiry(credit?.expires_at_ms)).join(", ")
-      : "expiry unavailable";
-    appendProviderFact(facts, "Banked resets", count + " \u2014 expires " + expires);
-    wrote = true;
+    // A real list: several credits can expire at different times, and each row
+    // renders the viewer's local time plus a simple day hint.
+    const block = document.createElement("section");
+    block.dataset.capacityWindow = "";
+    block.dataset.bankedResetDiagnostics = "";
+    const label = document.createElement("h4");
+    label.textContent = "Banked resets \u2014 " +
+      (Number.isSafeInteger(resetSetting.available_count)
+        ? String(resetSetting.available_count) + " available"
+        : "count unavailable");
+    block.appendChild(label);
+    const list = document.createElement("ul");
+    list.dataset.creditExpiries = "";
+    const items = credits && credits.length ? credits : [null];
+    const nowMs = Date.now();
+    for (const credit of items) {
+      const item = document.createElement("li");
+      const expiresAtMs = credit?.expires_at_ms ?? null;
+      const time = document.createElement("time");
+      time.textContent = formatCreditExpiry(expiresAtMs);
+      if (typeof expiresAtMs === "number" && Number.isFinite(expiresAtMs)) {
+        time.dateTime = new Date(expiresAtMs).toISOString();
+      }
+      item.appendChild(time);
+      const hint = creditExpiryHint(expiresAtMs, nowMs);
+      if (hint) {
+        const detail = document.createElement("small");
+        detail.textContent = " " + hint;
+        item.appendChild(detail);
+      }
+      list.appendChild(item);
+    }
+    block.appendChild(list);
+    diagnostics.appendChild(block);
   }
   if (overageSetting) {
+    const facts = document.createElement("dl");
+    facts.dataset.capacityMeta = "";
     const overage = overageSetting.overage;
     if (!overage) {
       appendProviderFact(facts, "Overage balance", "usage unavailable");
@@ -1107,9 +1147,8 @@ const appendCodexResetDiagnostics = (diagnostics, resetSetting, overageSetting) 
         : "unknown";
       appendProviderFact(facts, "Overage balance", balance + " \u2014 limit " + limit);
     }
-    wrote = true;
+    diagnostics.appendChild(facts);
   }
-  if (wrote) diagnostics.appendChild(facts);
 };
 
 const appendCapacitySourceMeta = (row, source, provider = null) => {
