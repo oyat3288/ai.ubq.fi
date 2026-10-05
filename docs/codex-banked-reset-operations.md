@@ -58,6 +58,19 @@ authoritative for that ordinary transition even though it cannot mint a banked-r
 account is retained until an authoritative transition, the persisted blocked cohort is evaluated only when the whole
 pool is exhausted.
 
+## Capacity-observed exhaustion (2026-10-05)
+
+Since the 2026-10-05 incident fix (`docs/incident-codex-banked-reset-capacity-deadlock-2026-10-05.md`), a fresh capacity
+observation at 100% used for the requested class with a future reset deadline is also an authoritative exhaustion
+source: routing yields the blocked identity from that observation, and the blocked-cohort evaluator materializes the
+durable class block (same persisted transition a live 429 uses) before evaluating, so an ordinary request arms and later
+spends. A 100%-used observation without a deadline keeps the account half-open as a bounded probe instead. A live stable
+future deadline supersedes an absent or expired prior observation for the ambiguity gate while the redemption ledger
+keeps each quota window spend-once. Empty blocked cohorts log `codex_banked_reset_preflight` with reason
+`no_blocked_identity` instead of returning silently. The once-per-UTC-day global cap described above was still enforced
+at the time of the incident; its approved replacement by one redemption per account per UTC day, together with an
+explicit per-account overage-usage setting, is recorded in `docs/DECISIONS.md` and pending implementation.
+
 Inventory reads have a fixed five-second deadline. Inventory failure or timeout skips reset work and leaves the ordinary
 retryable error in place. Malformed or unavailable durable routing state also fails retryably before dispatch; the
 gateway never guesses a sibling, deletes state, or advances the paid waterfall from an unproven cohort.

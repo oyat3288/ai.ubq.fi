@@ -6,6 +6,42 @@ higher authority.
 
 Provider routing decisions are maintained separately in `docs/provider-decision-journal.md`.
 
+## Capacity-observed exhaustion feeds the blocked cohort and materializes the reset fence - 2026-10-05
+
+A fresh capacity observation that shows the requested quota class at 100% used with a future reset deadline is now
+authoritative quota-block evidence for banked-reset routing: the account yields a blocked identity (`quotaResetAtMs` =
+the observed reset) instead of a bare skip, and the blocked-cohort evaluator materializes the durable class block
+through the same persisted path a live 429 uses before it evaluates the pool. Without a deadline the account stays
+half-open as a bounded probe (claimable without a class-block deadline) so either the request serves or a fresh 429
+re-arms the fences. A live stable future deadline supersedes an absent or expired prior observation for the ambiguity
+gate; the durable redemption ledger still makes every quota window spend-once. Empty blocked cohorts are logged
+(`codex_banked_reset_preflight`, reason `no_blocked_identity`) instead of returning silently.
+
+Reason: production spent four weeks unable to redeem resets because capacity-only exhaustion dead-ended locally with no
+dispatch path, so no fence could ever arm and stuck ambiguity could never clear (incident
+`docs/incident-codex-banked-reset-capacity-deadlock-2026-10-05.md`).
+
+Reversal risk: restoring the silent skip reintroduces the dead end and hides it from telemetry; treating deadline-less
+exhaustion as a blocked cohort fabricates an identity the claim fence cannot prove; removing the materialization step
+leaves evaluations that pass in memory but fail the KV fence at claim time.
+
+## Per-account daily redemption cap and explicit overage spending are approved - 2026-10-05 (implementation pending)
+
+Approved direction, not yet implemented:
+
+- Replace the once-per-UTC-day global redemption cap with one redemption per account per UTC day; keep the exact-once
+  per account per quota window ledger, the shadow arming gate, and the non-negotiable "at most one" semantics at the
+  per-account scope.
+- Add an explicit per-account overage-usage setting surfaced in the Providers view (checkbox) with default off, so
+  spending OpenAI overage credits is visible and deliberate. The intended policy is: prefer banked resets; allow overage
+  only when no banked resets remain for the account (or the operator explicitly enables overage).
+
+Reason: the global cap made two expiring credits unusable on the same night (only one redemption was possible across all
+accounts), and overage spending was previously invisible and implicit.
+
+Reversal risk: granting more than one redemption per account per day widens the worst-case credit burn if a loop
+fabricates distinct exhaustion episodes; enabling overage by default restores silent credit spending.
+
 ## Stage 1 key administration shows effective limits and audits every key change for 90 days - 2026-10-04
 
 The API Keys view presents request-quota and paid-overflow limits with the same explicit Unlimited checkbox in the
