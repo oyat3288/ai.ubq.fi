@@ -304,7 +304,10 @@ Deno.test("audit reads are bounded, paginate newest-first and validate the curso
   // the expired seed is excluded from the bounded page.
   const bounded = await listAudit("?limit=100000");
   assert.equal(bounded.body.data?.length, 5);
-  assert.equal(bounded.body.data.some((event) => event.id === "expired-event"), false);
+  assert.equal(
+    bounded.body.data.some((event) => event.id === "expired-event"),
+    false
+  );
 });
 
 Deno.test("no-op patch and already-active unrevoke keep success without fabricating an event", async () => {
@@ -332,7 +335,10 @@ Deno.test("revoke, unrevoke and final delete audit commits fail closed without k
   const failedRevoke = await handleAdminApiKeysRevoke(revokeRequest({ id }), sharedContext());
   assert.equal(failedRevoke.status, 409);
   assert.equal(storedRecord(id)?.revoked_at_ms, null);
-  assert.equal((await listAudit()).body.data?.some((event) => event.action === "revoke"), false);
+  assert.equal(
+    (await listAudit()).body.data?.some((event) => event.action === "revoke"),
+    false
+  );
 
   assert.equal((await handleAdminApiKeysRevoke(revokeRequest({ id }), sharedContext())).status, 200);
   const revokeEvents = (await listAudit()).body.data?.filter((event) => event.action === "revoke").length ?? 0;
@@ -352,7 +358,10 @@ Deno.test("revoke, unrevoke and final delete audit commits fail closed without k
   const failedDelete = await handleAdminApiKeysDelete(deleteRequest({ id }), sharedContext());
   assert.equal(failedDelete.status, 409);
   assert.equal(kvStore.has(keyToString([...KEY_ID_PREFIX, id])), true);
-  assert.equal((await listAudit()).body.data?.some((event) => event.action === "delete"), false);
+  assert.equal(
+    (await listAudit()).body.data?.some((event) => event.action === "delete"),
+    false
+  );
   assert.equal((await listAudit()).body.data?.filter((event) => event.action === "revoke").length ?? 0, revokeEvents + 1);
 });
 
