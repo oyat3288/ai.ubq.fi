@@ -1070,10 +1070,23 @@ const capacityProviderStatus = (source, provider) => {
   };
 };
 
-/** Diagnostics-only credit expiry text in the viewer's local zone; null stays explicit. */
+/**
+ * Diagnostics-only credit expiry text in the viewer's local zone; null stays
+ * explicit. Component options are used instead of `dateStyle`/`timeStyle`,
+ * because ECMA-402 forbids combining the date-time style options with
+ * `timeZoneName`: V8 throws `TypeError: Invalid option : option`, which aborted
+ * the capacity list render and left the analytics panel blank.
+ */
 const formatCreditExpiry = (value) =>
   typeof value === "number" && Number.isFinite(value)
-    ? new Date(value).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short", timeZoneName: "short" })
+    ? new Date(value).toLocaleString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "short",
+    })
     : "expiry unavailable";
 
 /** A short integer-day hint for a future credit expiry; unknown values add nothing. */
