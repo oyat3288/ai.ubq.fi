@@ -5,8 +5,9 @@ import {
   handleJevResponsesCompaction,
   isJevCompactionRequest,
   setJevCompactionAskerForTest,
+  SUMMARY_CHAR_CAP,
 } from "../src/jev_compaction/compaction.ts";
-import { MAX_SUMMARY_CHARS, parseCodexInput, renderSummary, SUMMARY_MARKER } from "../lib/jev_compaction/codex_items.ts";
+import { parseCodexInput, renderSummary, SUMMARY_MARKER } from "../lib/jev_compaction/codex_items.ts";
 import { collectToolCalls } from "../lib/jev_compaction/state.ts";
 import type { JevAsker, JevQuestions, JevResponse } from "../lib/jev_compaction/types.ts";
 import { getResponseTelemetry } from "../src/openai-telemetry.ts";
@@ -171,7 +172,7 @@ Deno.test("compaction fails closed on Jev error or a partial decision set", asyn
 
 Deno.test("compaction fails closed on an oversized summary", async () => {
   const oversized = [
-    text("user", `Goal: ${"x".repeat(MAX_SUMMARY_CHARS + 1_000)}`),
+    text("user", `Goal: ${"x".repeat(SUMMARY_CHAR_CAP + 1_000)}`),
     call("old", "echo old"),
     output("old", `RESULT_OBSOLETE `.repeat(40)),
     text("user", "recent one"),
@@ -186,6 +187,39 @@ Deno.test("compaction fails closed on an oversized summary", async () => {
     () => buildCompactionResponse(body(oversized), decisionAsker({ t1: { keepCall: 0.1, keepResult: 0.1 } }), { stream: true }),
     (error: unknown) => error instanceof CompactionUnavailable && error.kind === "summary-too-large"
   );
+});
+
+Deno.test("compaction fits kept results under the cap by dropping the lowest relevance first", async () => {
+  const chunk = 360_000;
+  const fitting = [
+    text("user", "Goal: keep the release evidence."),
+    call("old_a", "cat /tmp/a"),
+    output("old_a", "A".repeat(chunk)),
+    call("old_b", "cat /tmp/b"),
+    output("old_b", "B".repeat(chunk)),
+    call("old_c", "cat /tmp/c"),
+    output("old_c", "C".repeat(chunk)),
+    call("old_d", "cat /tmp/d"),
+    output("old_d", "D".repeat(chunk)),
+    call("old_e", "cat /tmp/e"),
+    output("old_e", "E".repeat(chunk)),
+    text("user", COMPACTION_PROMPT),
+  ];
+  const verdicts = {
+    t1: { keepCall: 0.9, keepResult: 0.6 },
+    t2: { keepCall: 0.9, keepResult: 0.7 },
+    t3: { keepCall: 0.9, keepResult: 0.8 },
+    t4: { keepCall: 0.9, keepResult: 0.9 },
+    t5: { keepCall: 0.9, keepResult: 0.95 },
+  };
+  const outcome = await buildCompactionResponse(body(fitting), decisionAsker(verdicts), { stream: false });
+  assert.equal(outcome.status, 200);
+  assert.match(outcome.headers["x-jev-compaction"] ?? "", /fitted=[1-9]/);
+  const parsed = JSON.parse(outcome.body) as { output?: { content?: { text?: string }[] }[] };
+  const summary = parsed.output?.[0]?.content?.[0]?.text ?? "";
+  assert.ok(summary.length <= SUMMARY_CHAR_CAP, "the fitted summary must respect the cap");
+  assert.ok(summary.includes("[tool result old_e — kept verbatim]"), "the highest-relevance result must stay verbatim");
+  assert.ok(summary.includes("[tool result old_a — truncated"), "the lowest-relevance result must be fitted away");
 });
 
 Deno.test("gateway handler fails closed without a credential and on caller cancellation", async () => {

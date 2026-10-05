@@ -1466,6 +1466,6 @@ removed; a missing OpenRouter credential is the only missing-key failure. Select
 and fail-closed behavior are unchanged. The adapter's rendered-memory bound is 1.5M characters, raised from the ported
 400k because text and pinned segments are never dropped or truncated and a text-heavy session can legitimately exceed
 the ported value; fitting first drops additional unpinned kept results, lowest Jev `keepResult` first, taking the
-minimal fitting prefix across re-renders, and the request still fails closed above the raised bound.
-`JEV_COMPACTION_DISABLED=1` bypasses interception entirely for an operator fallback to the ordinary provider route; it
-stays unset by default.
+minimal fitting prefix across re-renders, cap-forced drops count toward the reduction contract, and the request still
+fails closed above the raised bound. `JEV_COMPACTION_DISABLED=1` bypasses interception entirely for an operator fallback
+to the ordinary provider route; it stays unset by default.

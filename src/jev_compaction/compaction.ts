@@ -193,13 +193,10 @@ function assertEveryCandidateDecided(result: CompactResult, candidates: readonly
   }
 }
 
-function assertCompactionReduced(result: CompactResult): void {
-  const dropped = result.stats.resultsDropped + result.stats.callsDropped;
-  if (dropped === 0 || result.stats.charsAfter >= result.stats.charsBefore) {
-    throw new CompactionUnavailable(
-      "no-reduction",
-      `nothing was dropped (dropped=${dropped}, before=${result.stats.charsBefore}, after=${result.stats.charsAfter})`
-    );
+function assertCompactionReduced(stats: CompactResult["stats"]): void {
+  const dropped = stats.resultsDropped + stats.callsDropped;
+  if (dropped === 0 || stats.charsAfter >= stats.charsBefore) {
+    throw new CompactionUnavailable("no-reduction", `nothing was dropped (dropped=${dropped}, before=${stats.charsBefore}, after=${stats.charsAfter})`);
   }
 }
 
@@ -329,8 +326,10 @@ export async function buildCompactionResponse(body: unknown, asker: JevAsker, op
   }
 
   assertEveryCandidateDecided(result, candidates);
-  assertCompactionReduced(result);
+  // Fit first: cap-forced drops count toward the reduction contract, so a
+  // session whose kept render exceeds the cap can still compact.
   const fitted = fitCompactedSummary(transcript, calls, result);
+  assertCompactionReduced(fitted.stats);
   const summary = fitted.summary;
 
   logCompaction({
