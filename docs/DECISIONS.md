@@ -1463,4 +1463,7 @@ verify/CI must provide the scoped shell and loopback capabilities required by ev
 Compaction asks Jev through the gateway's normal Jev route: the OpenRouter System One endpoint with the shared
 `OPENROUTER_API_KEY` and default model that `/v1/systemone` serves with. The standalone `TYPESAFE_API_KEY` path is
 removed; a missing OpenRouter credential is the only missing-key failure. Selection, batching, the 30-second Jev bound,
-and fail-closed behavior are unchanged.
+and fail-closed behavior are unchanged. When the rendered summary still exceeds the 400,000-character cap, the adapter
+drops additional unpinned kept results, lowest Jev `keepResult` first, and takes the minimal fitting prefix across
+re-renders; pinned data is never dropped or truncated and the request still fails closed when even dropping every
+unpinned kept result cannot fit.

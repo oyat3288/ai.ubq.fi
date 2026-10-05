@@ -27,7 +27,7 @@ import { JevClient } from "../../lib/jev_compaction/client.ts";
 import { compact } from "../../lib/jev_compaction/compact.ts";
 import { isResponsesCompaction, MAX_SUMMARY_CHARS, parseCodexInput, parseTurnMetadata, renderSummary } from "../../lib/jev_compaction/codex_items.ts";
 import { collectToolCalls } from "../../lib/jev_compaction/state.ts";
-import type { CompactResult, JevAsker, ToolCall } from "../../lib/jev_compaction/types.ts";
+import type { CallDecision, CompactResult, JevAsker, ToolCall } from "../../lib/jev_compaction/types.ts";
 
 const TURN_METADATA_HEADER = "x-codex-turn-metadata";
 
@@ -120,8 +120,9 @@ function structuralHeader(counts: {
   pinned: number;
   charsBefore: number;
   charsAfter: number;
+  fitted?: number;
 }): string {
-  return [
+  const parts = [
     "summary",
     `kept=${counts.kept}`,
     `results_dropped=${counts.resultsDropped}`,
@@ -129,7 +130,9 @@ function structuralHeader(counts: {
     `pinned=${counts.pinned}`,
     `chars_before=${counts.charsBefore}`,
     `chars_after=${counts.charsAfter}`,
-  ].join("; ");
+  ];
+  if (counts.fitted !== undefined && counts.fitted > 0) parts.push(`fitted=${counts.fitted}`);
+  return parts.join("; ");
 }
 
 /**
@@ -177,13 +180,18 @@ function assertCompactionReduced(result: CompactResult): void {
   }
 }
 
-function renderCompactedSummary(transcript: ReturnType<typeof parseCodexInput>, calls: readonly ToolCall[], result: CompactResult): string {
+function renderCompactedSummary(
+  transcript: ReturnType<typeof parseCodexInput>,
+  calls: readonly ToolCall[],
+  result: CompactResult,
+  decisions: readonly CallDecision[] = result.decisions
+): string {
   if (transcript === null) throw new CompactionUnavailable("missing-input", "compaction request has no input items array");
   const callIds = new Map(calls.map((call) => [call.id, call.tool_use_id]));
   let summary: string;
   try {
     summary = renderSummary(transcript, {
-      decisions: result.decisions,
+      decisions,
       callIds,
       headChars: COMPACTION_OPTIONS.truncateHeadChars,
       stats: result.stats,
@@ -195,11 +203,71 @@ function renderCompactedSummary(transcript: ReturnType<typeof parseCodexInput>, 
   if (summary.trim().length === 0) {
     throw new CompactionUnavailable("empty-summary", "renderer produced an empty summary");
   }
-  if (summary.length > MAX_SUMMARY_CHARS) {
-    // Never truncate Jev-kept content silently: fail and keep Codex's history.
+  return summary;
+}
+
+/**
+ * Fits the rendered summary under `MAX_SUMMARY_CHARS` by dropping additional
+ * unpinned kept results, lowest Jev `keepResult` first, and taking the minimal
+ * fitting prefix across re-renders. Pinned data is never dropped or truncated;
+ * dropping every unpinned kept result is the floor, and beyond it the request
+ * still fails closed instead of shipping an oversized memory.
+ */
+function fitCompactedSummary(
+  transcript: ReturnType<typeof parseCodexInput>,
+  calls: readonly ToolCall[],
+  result: CompactResult
+): { summary: string; fittedDrops: number; stats: CompactResult["stats"] } {
+  const summary = renderCompactedSummary(transcript, calls, result);
+  if (summary.length <= MAX_SUMMARY_CHARS) return { summary, fittedDrops: 0, stats: result.stats };
+
+  const fitIds = result.decisions
+    .filter((decision) => decision.action === "keep" && decision.reason === "kept")
+    .sort((a, b) => a.keepResult - b.keepResult)
+    .map((decision) => decision.id);
+  const renderWithDropped = (count: number): string => {
+    const dropped = new Set(fitIds.slice(0, count));
+    const decisions = result.decisions.map((decision) =>
+      dropped.has(decision.id) ? { ...decision, action: "drop_result" as const, reason: "result_dropped" as const } : decision
+    );
+    return renderCompactedSummary(transcript, calls, result, decisions);
+  };
+
+  if (fitIds.length === 0) {
+    // Only pinned or already-dropped data exceeds the cap; nothing may shrink.
     throw new CompactionUnavailable("summary-too-large", `summary is ${summary.length} chars (limit ${MAX_SUMMARY_CHARS})`);
   }
-  return summary;
+  const floor = renderWithDropped(fitIds.length);
+  if (floor.length > MAX_SUMMARY_CHARS) {
+    throw new CompactionUnavailable(
+      "summary-too-large",
+      `summary is ${floor.length} chars (limit ${MAX_SUMMARY_CHARS}) with all ${fitIds.length} unpinned kept results dropped`
+    );
+  }
+  let low = 0;
+  let high = fitIds.length;
+  while (high - low > 1) {
+    const mid = Math.floor((low + high) / 2);
+    if (renderWithDropped(mid).length <= MAX_SUMMARY_CHARS) high = mid;
+    else low = mid;
+  }
+  const fitted = renderWithDropped(high);
+  if (fitted.length > MAX_SUMMARY_CHARS) {
+    // Fail closed: a non-monotone render must never ship an oversized summary.
+    throw new CompactionUnavailable("summary-too-large", `summary is ${fitted.length} chars (limit ${MAX_SUMMARY_CHARS})`);
+  }
+  const dropped = new Set(fitIds.slice(0, high));
+  const droppedChars = calls.filter((call) => dropped.has(call.id)).reduce((sum, call) => sum + call.resultChars, 0);
+  return {
+    summary: fitted,
+    fittedDrops: high,
+    stats: {
+      ...result.stats,
+      kept: Math.max(0, result.stats.kept - high),
+      resultsDropped: result.stats.resultsDropped + high,
+      charsAfter: Math.max(0, result.stats.charsAfter - droppedChars),
+    },
+  };
 }
 
 /**
@@ -236,26 +304,28 @@ export async function buildCompactionResponse(body: unknown, asker: JevAsker, op
 
   assertEveryCandidateDecided(result, candidates);
   assertCompactionReduced(result);
-  const summary = renderCompactedSummary(transcript, calls, result);
+  const fitted = fitCompactedSummary(transcript, calls, result);
+  const summary = fitted.summary;
 
   logCompaction({
     outcome: "ok",
     items: transcript.entries.length,
     candidates: candidates.length,
-    kept: result.stats.kept,
-    results_dropped: result.stats.resultsDropped,
-    calls_dropped: result.stats.callsDropped,
-    pinned: result.stats.pinned,
-    chars_before: result.stats.charsBefore,
-    chars_after: result.stats.charsAfter,
-    jev_requests: result.stats.requests,
-    state_stage: result.stats.stateStage || "none",
-    total_ms: result.stats.ms,
+    kept: fitted.stats.kept,
+    results_dropped: fitted.stats.resultsDropped,
+    calls_dropped: fitted.stats.callsDropped,
+    pinned: fitted.stats.pinned,
+    chars_before: fitted.stats.charsBefore,
+    chars_after: fitted.stats.charsAfter,
+    fitted: fitted.fittedDrops,
+    jev_requests: fitted.stats.requests,
+    state_stage: fitted.stats.stateStage || "none",
+    total_ms: fitted.stats.ms,
   });
 
   const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 16);
   const headers = {
-    "x-jev-compaction": structuralHeader(result.stats),
+    "x-jev-compaction": structuralHeader({ ...fitted.stats, fitted: fitted.fittedDrops }),
   };
   if (options.stream) {
     return {
