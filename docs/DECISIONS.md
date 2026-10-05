@@ -25,22 +25,38 @@ Reversal risk: restoring the silent skip reintroduces the dead end and hides it 
 exhaustion as a blocked cohort fabricates an identity the claim fence cannot prove; removing the materialization step
 leaves evaluations that pass in memory but fail the KV fence at claim time.
 
-## Per-account daily redemption cap and explicit overage spending are approved - 2026-10-05 (implementation pending)
+## Per-account daily redemption cap replaces the global daily cap - 2026-10-05
+
+Implemented: a banked-reset submission budget is one redemption per account per UTC day instead of one redemption per
+UTC day across all accounts. `CODEX_BANKED_RESET_MAX_PER_ACCOUNT_PER_DAY` replaces the retired
+`CODEX_BANKED_RESET_MAX_GLOBAL_PER_DAY`, which is no longer read; the parse default is `1`, and live mode requires
+exactly `1`. The terminal-outcome provider keeps a dedicated failure reason
+(`terminal_outcome_account_day_limit_must_be_one`); every other non-positive or non-one live value fails closed as
+`per_account_day_limit_invalid`. Each account's budget is the durable record at
+`["uos_ai", "codex_reset_redemption", "account_day", "v1", account_id_hash, day]`, charged atomically at the same
+durable `submitted` boundary the global record used, and refusals report `account_day_limit_reached`. The exact-once per
+account per quota window ledger, the shadow arming gate, and the at-most-once submission semantics are unchanged. Legacy
+`["uos_ai", "codex_reset_redemption", "global_day", "v1", day]` records are retained for rollback and never enforced, so
+a nonzero legacy count cannot block any account.
+
+Reason: the global cap made two expiring credits unusable on the same night (only one redemption was possible across all
+accounts).
+
+Reversal risk: granting more than one redemption per account per day widens the worst-case credit burn if a loop
+fabricates distinct exhaustion episodes; deleting or enforcing the retained legacy global_day rows would break the
+rollback path or reintroduce cross-account blocking.
+
+## Explicit per-account overage spending is approved - 2026-10-05 (implementation pending)
 
 Approved direction, not yet implemented:
 
-- Replace the once-per-UTC-day global redemption cap with one redemption per account per UTC day; keep the exact-once
-  per account per quota window ledger, the shadow arming gate, and the non-negotiable "at most one" semantics at the
-  per-account scope.
 - Add an explicit per-account overage-usage setting surfaced in the Providers view (checkbox) with default off, so
   spending OpenAI overage credits is visible and deliberate. The intended policy is: prefer banked resets; allow overage
   only when no banked resets remain for the account (or the operator explicitly enables overage).
 
-Reason: the global cap made two expiring credits unusable on the same night (only one redemption was possible across all
-accounts), and overage spending was previously invisible and implicit.
+Reason: overage spending was previously invisible and implicit.
 
-Reversal risk: granting more than one redemption per account per day widens the worst-case credit burn if a loop
-fabricates distinct exhaustion episodes; enabling overage by default restores silent credit spending.
+Reversal risk: enabling overage by default restores silent credit spending.
 
 ## Stage 1 key administration shows effective limits and audits every key change for 90 days - 2026-10-04
 
